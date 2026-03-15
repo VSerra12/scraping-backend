@@ -58,7 +58,6 @@ class ProductEnricher(BaseScraper):
 
     def _extract_tiendanube(self, soup: BeautifulSoup) -> dict:
         """Extrae info de página de producto de Tienda Nube."""
-        # Descripción
         description = None
         for sel in [".product-description", ".description", ".js-product-description"]:
             el = soup.select_one(sel)
@@ -68,7 +67,6 @@ class ProductEnricher(BaseScraper):
                     description = text[:1000]
                     break
 
-        # Talles y colores desde data-variants JSON
         sizes = []
         colors = []
         variants_el = soup.select_one("[data-variants]")
@@ -92,18 +90,17 @@ class ProductEnricher(BaseScraper):
             except (json.JSONDecodeError, KeyError):
                 pass
 
-        materials = self._extract_materials(soup, description)
+        materials_raw = self._extract_materials(soup, description)
 
         return {
             "description": description,
-            "materials": materials,
+            "materials_raw": materials_raw,
             "sizes": sizes,
             "colors_hint": colors,
         }
 
     def _extract_woocommerce(self, soup: BeautifulSoup) -> dict:
         """Extrae info de página de producto de WooCommerce."""
-        # Descripción corta (selector confirmado en dynamicjeans.com.ar)
         description = None
         for sel in [
             ".woocommerce-product-details__short-description",
@@ -118,7 +115,6 @@ class ProductEnricher(BaseScraper):
                     description = text[:1000]
                     break
 
-        # Talles — selector confirmado en dynamicjeans.com.ar
         sizes = []
         for sel in [
             "select[name*='talle']",
@@ -135,7 +131,6 @@ class ProductEnricher(BaseScraper):
                 ]
                 break
 
-        # Colores — selector confirmado en dynamicjeans.com.ar
         colors = []
         for sel in [
             "select[name*='color']",
@@ -151,11 +146,11 @@ class ProductEnricher(BaseScraper):
                 ]
                 break
 
-        materials = self._extract_materials(soup, description)
+        materials_raw = self._extract_materials(soup, description)
 
         return {
             "description": description,
-            "materials": materials,
+            "materials_raw": materials_raw,
             "sizes": sizes,
             "colors_hint": colors,
         }
@@ -174,8 +169,8 @@ class ProductEnricher(BaseScraper):
                     description = text[:1000]
                     break
 
-        materials = self._extract_materials(soup, description)
-        return {"description": description, "materials": materials, "sizes": [], "colors_hint": []}
+        materials_raw = self._extract_materials(soup, description)
+        return {"description": description, "materials_raw": materials_raw, "sizes": [], "colors_hint": []}
 
     def _extract_materials(self, soup: BeautifulSoup, description: Optional[str]) -> Optional[str]:
         """Busca composición/materiales en la página o en la descripción."""
@@ -186,7 +181,6 @@ class ProductEnricher(BaseScraper):
                 if text:
                     return text[:300]
 
-        # Buscar keywords de tela dentro de la descripción
         fabric_keywords = [
             "tela:", "tejido:", "composición:", "composicion:", "material:",
             "confeccionado en", "100%", "polyester", "algodón", "cotton",
@@ -226,7 +220,6 @@ def run_enrichment_job(db: Session, batch_size: int = 20, store_id: int = None) 
     enriched_count = 0
     failed_count = 0
 
-    # Precargar tiendas para evitar N+1 queries
     store_ids = {p.store_id for p in pending}
     stores = {s.id: s for s in db.query(Store).filter(Store.id.in_(store_ids)).all()}
 
@@ -238,17 +231,15 @@ def run_enrichment_job(db: Session, batch_size: int = 20, store_id: int = None) 
         try:
             enriched_data = enricher.enrich_product(product, store)
 
-            # Actualizar campos con la info extraída
             if enriched_data.get("description"):
                 product.description = enriched_data["description"]
-            if enriched_data.get("materials"):
-                product.materials = enriched_data["materials"]
+            if enriched_data.get("materials_raw"):          # ← era "materials"
+                product.materials_raw = enriched_data["materials_raw"]
             if enriched_data.get("sizes"):
                 product.sizes = enriched_data["sizes"]
 
             colors_hint = enriched_data.get("colors_hint", [])
 
-            # Clasificar con IA usando toda la info disponible
             classification = classify_product(
                 title=product.title,
                 description=product.description,
@@ -257,21 +248,45 @@ def run_enrichment_job(db: Session, batch_size: int = 20, store_id: int = None) 
                 colors_hint=colors_hint,
             )
 
-            product.category = classification["category"]
-            product.subcategory = classification["subcategory"]
-            product.colors = classification["colors"]
-            product.style_tags = classification["style_tags"]
-            product.gender = classification["gender"]
+            # Campos base
+            product.category         = classification["category"]
+            product.subcategory      = classification["subcategory"]
+            product.colors           = classification["colors"]
+            product.style_tags       = classification["style_tags"]
+            product.gender           = classification["gender"]
+            product.condition        = classification.get("condition", "new")
+
+            # Silueta y corte
+            product.cut              = classification.get("cut")
+            product.leg_cut          = classification.get("leg_cut")
+            product.rise             = classification.get("rise")
+            product.length           = classification.get("length")
+
+            # Materiales y textura
+            product.materials        = classification.get("materials", [])
+            product.texture          = classification.get("texture")
+            product.thickness        = classification.get("thickness")
+            product.stretch          = classification.get("stretch")
+
+            # Color y patrón
+            product.colors_secondary = classification.get("colors_secondary", [])
+            product.pattern          = classification.get("pattern")
+
+            # Detalles constructivos
+            product.design_details   = classification.get("design_details", [])
+            product.neck_type        = classification.get("neck_type")
+            product.sleeve_type      = classification.get("sleeve_type")
+            product.hem_finish       = classification.get("hem_finish")
+
             product.ai_classified = True
-            product.enriched = True
+            product.enriched      = True
 
             db.flush()
             enriched_count += 1
-            logger.info(f"  ✓ {product.title[:40]} → {product.category} {product.colors}")
+            logger.info(f"  ✓ {product.title[:40]} → {product.category} / {product.cut} / {product.colors}")
 
         except Exception as e:
             logger.error(f"  ✗ Error enriqueciendo '{product.title[:40]}': {e}")
-            # Marcar como enriched para no reintentar indefinidamente en este ciclo
             product.enriched = True
             failed_count += 1
             try:
@@ -280,7 +295,6 @@ def run_enrichment_job(db: Session, batch_size: int = 20, store_id: int = None) 
                 db.rollback()
             continue
 
-        # Rate limiting entre requests a páginas
         time.sleep(random.uniform(1.0, 2.0))
 
     db.commit()

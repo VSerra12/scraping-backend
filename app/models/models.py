@@ -42,21 +42,37 @@ class Product(Base):
     product_url = Column(String(1000), nullable=False)
 
     # Info enriquecida (extraída de la página individual del producto)
-    materials = Column(String(500), nullable=True)   # ej: "NEO MORLEY BASTÓN FINO"
-    sizes = Column(JSON, default=list)               # ej: ["S", "M", "L", "XL"]
+    materials_raw = Column(String(500), nullable=True)  # texto crudo de la página, ej: "NEO MORLEY BASTÓN FINO"
+    sizes = Column(JSON, default=list)                  # ej: ["S", "M", "L", "XL"]
 
-    # Clasificación por IA
+    # Clasificación por IA — campos base
     category = Column(String(100), nullable=True, index=True)
-    subcategory = Column(String(100), nullable=True)
-    colors = Column(JSON, default=list)              # ["negro", "blanco"]
+    subcategory = Column(String(200), nullable=True)
+    colors = Column(JSON, default=list)              # colores principales: ["negro", "blanco"]
     style_tags = Column(JSON, default=list)          # ["urbano", "casual"]
-    gender = Column(String(20), nullable=True)       # hombre/mujer/unisex
+    gender = Column(String(20), nullable=True)       # hombre | mujer | unisex
+
+    # Clasificación por IA — campos expandidos
+    cut = Column(String(50), nullable=True)
+    leg_cut  = Column(String(50), nullable=True)  # skinny | slim | straight | wide_leg | etc.
+    rise     = Column(String(50), nullable=True)  # low_rise | mid_rise | high_rise
+    length   = Column(String(50), nullable=True)  # cropped | corto | midi | tobillero | largo# slim_fit | regular_fit | oversize | recto | a_line | cropped
+    materials = Column(JSON, default=list)           # ["algodon", "elastano"] — normalizado por IA
+    texture = Column(String(50), nullable=True)      # suave | rugosa | rigida | elastica
+    thickness = Column(String(50), nullable=True)    # liviano | medio | grueso
+    stretch = Column(Boolean, nullable=True)         # True si tiene elasticidad
+    colors_secondary = Column(JSON, default=list)    # colores secundarios o de detalles
+    pattern = Column(String(50), nullable=True)      # liso | rayado | floral | cuadros | animal_print | etc.
+    design_details = Column(JSON, default=list)      # ["botones", "capucha", "bolsillos"]
+    neck_type = Column(String(50), nullable=True)    # redondo | v | alto | camisa | bote | halter
+    sleeve_type = Column(String(50), nullable=True)  # corta | larga | tres_cuartos | sin_mangas | globo | raglan
+    hem_finish = Column(String(50), nullable=True)   # dobladillo_simple | elastizado | ribbed | raw_hem
 
     # Estado
     condition = Column(String(20), default="new")
     available = Column(Boolean, default=True)
     ai_classified = Column(Boolean, default=False)
-    enriched = Column(Boolean, default=False, index=True)  # si ya visitó su página individual
+    enriched = Column(Boolean, default=False, index=True)
 
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -69,6 +85,8 @@ class Product(Base):
         Index("ix_products_category_gender", "category", "gender"),
         Index("ix_products_store_available", "store_id", "available"),
         Index("ix_products_enriched", "enriched", "ai_classified"),
+        Index("ix_products_cut", "cut"),
+        Index("ix_products_pattern", "pattern"),
     )
 
     def __repr__(self):
@@ -76,10 +94,6 @@ class Product(Base):
 
 
 class ProductVariant(Base):
-    """
-    Variantes de color de un producto (ej: remera emily // negro, blanco, gris).
-    El producto principal guarda la primera variante; las demás se guardan aquí.
-    """
     __tablename__ = "product_variants"
 
     id = Column(Integer, primary_key=True, index=True)

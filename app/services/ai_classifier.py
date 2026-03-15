@@ -14,33 +14,126 @@ logger = logging.getLogger(__name__)
 
 client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
 
-CLASSIFICATION_PROMPT = """Sos un experto en moda argentina. Tu tarea es clasificar prendas de ropa.
+# ─────────────────────────────────────────────────────────────────────────────
+#  System prompt (separado del user message para mejor control)
+# ─────────────────────────────────────────────────────────────────────────────
+CLASSIFICATION_SYSTEM = """
+Sos un experto en moda argentina. Tu única tarea es clasificar prendas de ropa.
+Estos son SIEMPRE productos de vestimenta de tiendas argentinas.
 
-Producto:
-Título: {title}
-Descripción: {description}
-Materiales/Tela: {materials}
+Devolvés ÚNICAMENTE un objeto JSON válido. Sin texto adicional, sin backticks, sin explicaciones.
+
+CAMPOS Y VALORES PERMITIDOS:
+
+category (obligatorio):
+  remera | musculosa | crop_top | blusa | camisa | polo | top | body |
+  jean | pantalon | short | bermuda | falda | legging | calza | culotte |
+  vestido | blazer | campera | tapado | chaleco | cardigan | sweater | buzo |
+  jogger | chomba | conjunto | accesorio | zapatillas | otro
+
+subcategory (obligatorio):
+  Texto libre MUY descriptivo combinando tipo + fit + largo + tiro + detalles clave.
+  Ejemplos:
+    "remera oversized cropped manga corta cuello redondo"
+    "jean wide leg tiro alto largo completo"
+    "vestido midi wrap escote v sin mangas"
+    "campera oversized con capucha"
+    "falda mini plisada a-line"
+
+fit (puede ser null):
+  slim_fit | regular_fit | relaxed_fit | oversize | boxy | entallado | null
+
+leg_cut (solo para pantalones/jeans/shorts/faldas, puede ser null):
+  skinny | slim | straight | regular | tapered | wide_leg | baggy |
+  bootcut | flare | palazzo | a_line | pencil | null
+
+rise (solo para prendas inferiores, puede ser null):
+  low_rise | mid_rise | high_rise | null
+
+length (puede ser null):
+  cropped | corto | midi | tobillero | largo | null
+
+materials (array, puede estar vacío []):
+  algodon, lino, denim, lana, poliester, seda, cuero, viscosa, elastano,
+  nylon, acrilico, modal, rayon, cachemir, morley, lycra, spandex,
+  gabardina, microfibra, jersey, otro
+
+texture (puede ser null):
+  suave | rugosa | rigida | elastica | otro | null
+
+thickness (puede ser null):
+  liviano | medio | grueso | null
+
+stretch (puede ser null):
+  true si tiene elasticidad/stretch, false si no, null si no se puede determinar
+
+colors (array, obligatorio, al menos 1):
+  negro, blanco, gris, rojo, azul, verde, amarillo, naranja, rosa, violeta,
+  marron, beige, celeste, bordo, camel, nude, dorado, plateado, multicolor,
+  azul marino, verde oliva
+
+colors_secondary (array, puede estar vacío []):
+  Mismos valores que colors. Colores de detalles o secundarios.
+
+pattern (puede ser null):
+  liso | rayado | floral | cuadros | animal_print | tie_dye | geometrico |
+  lunares | abstracto | estampado_grafico | otro | null
+
+design_details (array, puede estar vacío []):
+  botones, cierre, bolsillos, bordados, volados, pliegues, costuras_visibles,
+  capucha, hombreras, lazos, flecos, encaje, apliques, estampado_grafico,
+  rasgado, parches, tiras_cruzadas, ribetes, hotfix, abertura, lazo, faja
+
+neck_type (puede ser null — solo para prendas superiores):
+  redondo | v | alto | camisa | bote | halter | bandeja | asimetrico | sin_cuello | otro | null
+
+sleeve_type (puede ser null — solo para prendas superiores):
+  corta | larga | tres_cuartos | sin_mangas | globo | raglan | campana | otra | null
+
+hem_finish (puede ser null):
+  dobladillo_simple | elastizado | ribbed | raw_hem | otro | null
+
+style_tags (array, al menos 1):
+  urbano, deportivo, casual, elegante, vintage, oriental, bohemio,
+  minimalista, romantico, streetwear, formal, oversize, comodo,
+  trendy, rock, basico, preppy, gothic, y2k, surf, outdoor
+
+gender (obligatorio):
+  mujer | hombre | unisex
+
+condition (obligatorio):
+  new | used
+
+REGLAS:
+- Si el título es un nombre propio (ej: "PENNY", "LIA", "BARBI"), usá descripción e imagen.
+- Si hay colores_hint en el mensaje, usá ESOS colores en el campo colors.
+- NUNCA uses strings vacíos en campos obligatorios.
+- Materiales: "morley" → algodon, "jean/denim" → denim, "lycra/spandex" → elastano, "jersey" → jersey.
+- Para gender: si no hay indicación clara, inferí por estilo y tienda.
+- leg_cut, rise y length son MUY importantes para pantalones y jeans — intentá siempre inferirlos.
+- fit para prendas superiores indica silueta (oversize, slim, etc.).
+
+EJEMPLOS DE CLASIFICACIÓN CORRECTA:
+
+Título: "BARBI LOCALIZADO" / Desc: "Jean tiro alto piernas anchas elastizado"
+→ category: jean, fit: relaxed_fit, leg_cut: wide_leg, rise: high_rise, length: largo,
+   stretch: true, materials: [denim, elastano]
+
+Título: "OSLO" / Desc: "Remera básica de jersey 100% algodón cuello redondo oversize"
+→ category: remera, fit: oversize, neck_type: redondo, sleeve_type: corta,
+   materials: [algodon, jersey], length: regular
+
+Título: "FALDA PLISADA MIDI"
+→ category: falda, leg_cut: a_line, length: midi, pattern: liso
+"""
+
+USER_TEMPLATE = """Título: {title}
 Tienda: {store_context}
+Descripción: {description}
+Materiales detectados en página: {materials}
 {colors_line}
 
-INSTRUCCIONES IMPORTANTES:
-- Estos son SIEMPRE prendas de vestir de una tienda de ropa argentina.
-- Si el título es solo un nombre propio (ej: "PENNY", "LIA", "BARREL"), usá la descripción e imagen para clasificar.
-- NUNCA uses "otro", "sin especificar", "no especificado" ni strings vacíos.
-- Si hay "Colores disponibles" listados arriba, usá esos directamente en el campo colors.
-- Para género: si no hay indicación clara, inferí por el estilo de la prenda y la tienda.
-
-Respondé SOLO con JSON válido, sin texto adicional ni backticks:
-{{
-  "category": "remera|buzo|campera|pantalon|zapatillas|vestido|falda|bermuda|short|jogger|chomba|chaleco|tapado|impermeable|top|jean|calza|body|musculosa|blazer|camisa|cardigan|sweater|accesorio",
-  "subcategory": "descripción breve (ej: manga larga, oversize, tiro alto, cuello redondo, bastón fino)",
-  "colors": ["color1", "color2"],
-  "style_tags": ["estilo1", "estilo2"],
-  "gender": "hombre|mujer|unisex"
-}}
-
-Colores válidos: negro, blanco, rojo, azul, verde, amarillo, rosa, gris, beige, marrón, naranja, violeta, celeste, bordó, camel, nude, estampado, multicolor, azul marino, verde oliva.
-Estilos válidos: urbano, deportivo, casual, elegante, vintage, streetwear, bohemio, minimalista, formal, oversize, slim, cómodo, trendy, romántico, rock, básico."""
+Clasificá esta prenda:"""
 
 
 def classify_product(
@@ -58,11 +151,11 @@ def classify_product(
     desc = description or "Sin descripción — clasificar por título e imagen"
     store_context = store_name or "tienda de ropa argentina"
 
-    # Detectar materiales embebidos en la descripción
     materials = "No especificado"
     if description:
-        mat_keywords = ["tela:", "tejido:", "composición:", "material:", "confeccionado en",
-                        "100%", "morley", "lycra", "algodón", "polyester", "microfibra"]
+        mat_keywords = ["tela:", "tejido:", "composición:", "composicion:", "material:",
+                        "confeccionado en", "100%", "morley", "lycra", "algodón", "polyester",
+                        "microfibra", "denim", "lino", "seda", "modal", "spandex"]
         for kw in mat_keywords:
             if kw in description.lower():
                 materials = description[:300]
@@ -70,9 +163,9 @@ def classify_product(
 
     colors_line = ""
     if colors_hint:
-        colors_line = f"Colores disponibles (reales, usar estos): {', '.join(colors_hint)}"
+        colors_line = f"Colores disponibles (reales, usar estos en el campo colors): {', '.join(colors_hint)}"
 
-    prompt = CLASSIFICATION_PROMPT.format(
+    prompt = USER_TEMPLATE.format(
         title=title,
         description=desc[:600],
         materials=materials,
@@ -80,7 +173,6 @@ def classify_product(
         colors_line=colors_line,
     )
 
-    # Intentar con imagen primero
     if image_url:
         result = _classify_with_image(prompt, image_url)
         if result:
@@ -88,7 +180,6 @@ def classify_product(
                 result["colors"] = [c.lower() for c in colors_hint[:5]]
             return result
 
-    # Fallback: solo texto
     result = _classify_text_only(prompt)
     if colors_hint:
         result["colors"] = [c.lower() for c in colors_hint[:5]]
@@ -105,6 +196,7 @@ def _classify_with_image(prompt: str, image_url: str) -> Optional[dict]:
         message = client.messages.create(
             model=settings.AI_MODEL,
             max_tokens=settings.AI_MAX_TOKENS,
+            system=CLASSIFICATION_SYSTEM,
             messages=[{
                 "role": "user",
                 "content": [
@@ -133,6 +225,7 @@ def _classify_text_only(prompt: str) -> dict:
         message = client.messages.create(
             model=settings.AI_MODEL,
             max_tokens=settings.AI_MAX_TOKENS,
+            system=CLASSIFICATION_SYSTEM,
             messages=[{"role": "user", "content": prompt}]
         )
         return _parse_response(message.content[0].text)
@@ -163,7 +256,6 @@ def _download_image(url: str) -> tuple[Optional[str], str]:
             else:
                 media_type = "image/jpeg"
 
-            # Imágenes muy grandes aumentan el costo innecesariamente
             if len(r.content) > 1_500_000:
                 logger.debug(f"Imagen muy grande ({len(r.content)} bytes), skip")
                 return None, media_type
@@ -178,7 +270,6 @@ def _download_image(url: str) -> tuple[Optional[str], str]:
 def _parse_response(raw: str) -> dict:
     """Parsea y limpia la respuesta JSON de Claude."""
     raw = raw.strip()
-    # Limpiar backticks si los hay
     if "```" in raw:
         for part in raw.split("```"):
             part = part.strip().lstrip("json").strip()
@@ -194,43 +285,89 @@ def _parse_response(raw: str) -> dict:
 
     INVALID = {
         "sin especificar", "sin definir", "no especificado", "indeterminado",
-        "n/a", "otro", "", "sin información", "no disponible", "no especificado",
+        "n/a", "", "sin información", "no disponible",
     }
 
-    colors = [c for c in (data.get("colors") or []) if c and c.lower() not in INVALID]
+    def clean_list(val):
+        if not val or not isinstance(val, list):
+            return []
+        return [v for v in val if v and str(v).lower() not in INVALID]
+
+    def clean_str(val, fallback=None):
+        if not val or str(val).lower() in INVALID:
+            return fallback
+        return str(val).lower().strip()
+
+    colors = clean_list(data.get("colors"))
     if not colors:
         colors = ["negro"]
 
-    style_tags = [s for s in (data.get("style_tags") or []) if s and s.lower() not in INVALID]
+    style_tags = clean_list(data.get("style_tags"))
     if not style_tags:
         style_tags = ["casual"]
 
-    category = (data.get("category") or "").lower().strip()
-    if not category or category in INVALID:
-        category = "remera"
-
+    category = clean_str(data.get("category"), "otro")
     subcategory = (data.get("subcategory") or "").strip()
     if subcategory.lower() in INVALID:
         subcategory = ""
 
-    gender = (data.get("gender") or "mujer").lower()
+    gender = clean_str(data.get("gender"), "unisex")
     if gender not in ("hombre", "mujer", "unisex"):
-        gender = "mujer"
+        gender = "unisex"
 
     return {
-        "category": category,
-        "subcategory": subcategory,
-        "colors": colors,
-        "style_tags": style_tags,
-        "gender": gender,
+        # Campos base
+        "category":         category,
+        "subcategory":      subcategory,
+        "colors":           colors,
+        "style_tags":       style_tags,
+        "gender":           gender,
+        "condition":        clean_str(data.get("condition"), "new"),
+
+        # Silueta y corte
+        "cut":              clean_str(data.get("fit") or data.get("cut")),  # "fit" es el nombre nuevo
+        "leg_cut":          clean_str(data.get("leg_cut")),
+        "rise":             clean_str(data.get("rise")),
+        "length":           clean_str(data.get("length")),
+
+        # Materiales y textura
+        "materials":        clean_list(data.get("materials")),
+        "texture":          clean_str(data.get("texture")),
+        "thickness":        clean_str(data.get("thickness")),
+        "stretch":          data.get("stretch") if isinstance(data.get("stretch"), bool) else None,
+
+        # Color y patrón
+        "colors_secondary": clean_list(data.get("colors_secondary")),
+        "pattern":          clean_str(data.get("pattern")),
+
+        # Detalles constructivos
+        "design_details":   clean_list(data.get("design_details")),
+        "neck_type":        clean_str(data.get("neck_type")),
+        "sleeve_type":      clean_str(data.get("sleeve_type")),
+        "hem_finish":       clean_str(data.get("hem_finish")),
     }
 
 
 def _fallback_classification() -> dict:
     return {
-        "category": "remera",
-        "subcategory": "",
-        "colors": ["negro"],
-        "style_tags": ["casual"],
-        "gender": "mujer",
+        "category":         "otro",
+        "subcategory":      "",
+        "colors":           ["negro"],
+        "style_tags":       ["casual"],
+        "gender":           "unisex",
+        "condition":        "new",
+        "cut":              None,
+        "leg_cut":          None,
+        "rise":             None,
+        "length":           None,
+        "materials":        [],
+        "texture":          None,
+        "thickness":        None,
+        "stretch":          None,
+        "colors_secondary": [],
+        "pattern":          None,
+        "design_details":   [],
+        "neck_type":        None,
+        "sleeve_type":      None,
+        "hem_finish":       None,
     }

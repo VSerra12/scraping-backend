@@ -43,23 +43,83 @@ class VariantRead(BaseModel):
 class ProductRead(BaseModel):
     id: int
     title: str
-    description: Optional[str]
-    price: Optional[float]
+    description: Optional[str] = None
+    price: Optional[float] = None
     currency: str
-    image_url: Optional[str]
+    image_url: Optional[str] = None
     product_url: str
-    category: Optional[str]
-    subcategory: Optional[str]
-    colors: Optional[List[str]]
-    style_tags: Optional[List[str]]
-    gender: Optional[str]
-    materials: Optional[str] = None
-    sizes: Optional[List[str]] = None
-    enriched: bool = False
-    ai_classified: bool = False
-    available: bool
     store_id: int
     store_name: Optional[str] = None
+
+    # Info enriquecida
+    materials_raw: Optional[str] = None
+    sizes: Optional[List[str]] = None
+
+    # Clasificación base
+    category: Optional[str] = None
+    subcategory: Optional[str] = None
+    colors: Optional[List[str]] = None
+    style_tags: Optional[List[str]] = None
+    gender: Optional[str] = None
+
+    # Clasificación expandida
+    cut: Optional[str] = None
+    leg_cut:  Optional[str] = None
+    rise:     Optional[str] = None
+    length:   Optional[str] = None
+    materials: Optional[List[str]] = None
+    texture: Optional[str] = None
+    thickness: Optional[str] = None
+    stretch: Optional[bool] = None
+    colors_secondary: Optional[List[str]] = None
+    pattern: Optional[str] = None
+    design_details: Optional[List[str]] = None
+    neck_type: Optional[str] = None
+    sleeve_type: Optional[str] = None
+    hem_finish: Optional[str] = None
+
+    # Estado
+    condition: str = "new"
+    available: bool = True
+    enriched: bool = False
+    ai_classified: bool = False
+
+    variants: List[VariantRead] = []
+
+    model_config = {"from_attributes": True}
+
+
+class ProductSummary(BaseModel):
+    """Versión reducida para listados y resultados de búsqueda (menos payload)."""
+    id: int
+    title: str
+    price: Optional[float] = None
+    currency: str = "ARS"
+    image_url: Optional[str] = None
+    product_url: str
+    store_id: int
+    store_name: Optional[str] = None
+    category: Optional[str] = None
+    subcategory: Optional[str] = None
+    colors: Optional[List[str]] = None
+    colors_secondary: Optional[List[str]] = None
+    pattern: Optional[str] = None
+    gender: Optional[str] = None
+    cut: Optional[str] = None
+    leg_cut:  Optional[str] = None
+    rise:     Optional[str] = None
+    length:   Optional[str] = None
+    style_tags: Optional[List[str]] = None
+    texture: Optional[str] = None
+    materials: Optional[List[str]] = None
+    design_details: Optional[List[str]] = None
+    neck_type: Optional[str] = None
+    sleeve_type: Optional[str] = None
+    hem_finish: Optional[str] = None
+    description: Optional[str] = None
+    sizes: Optional[List[str]] = None
+    available: bool = True
+    ai_classified: bool = False
     variants: List[VariantRead] = []
 
     model_config = {"from_attributes": True}
@@ -70,6 +130,9 @@ class ProductRead(BaseModel):
 class SearchRequest(BaseModel):
     query: str = ""
     limit: int = 50
+    offset: int = 0
+
+    # Filtros base
     category: Optional[str] = None
     min_price: Optional[float] = None
     max_price: Optional[float] = None
@@ -77,7 +140,14 @@ class SearchRequest(BaseModel):
     color: Optional[str] = None
     gender: Optional[str] = None
     location: Optional[str] = None
-    offset: int = 0
+
+    # Filtros expandidos
+    cut: Optional[str] = None
+    pattern: Optional[str] = None
+    style_tag: Optional[str] = None
+    neck_type: Optional[str] = None
+    sleeve_type: Optional[str] = None
+    stretch: Optional[bool] = None
 
     @field_validator("limit")
     @classmethod
@@ -93,7 +163,7 @@ class SearchRequest(BaseModel):
 class SearchResponse(BaseModel):
     query: str
     total: int
-    results: List[ProductRead]
+    results: List[ProductSummary]
 
 
 # ── Stats ────────────────────────────────────────────────────────────────────

@@ -5,28 +5,34 @@ Backend de búsqueda inteligente de ropa en tiendas argentinas.
 ## Arquitectura
 
 ```
-fashion_search/
+backend/
 ├── main.py                          # Entrypoint FastAPI
 ├── requirements.txt
-├── .env.example
-├── seed_stores.py                   # Script: cargar tiendas reales
-├── seed_mock_products.py            # Script: cargar datos de prueba
+├── README.md
 └── app/
     ├── api/
-    │   └── routes.py                # Todos los endpoints REST
+    │   ├── ai_routes.py             # Endpoints para IA (clasificación)
+    │   ├── routes.py                # Endpoints principales REST
+    │   └── scraping_router.py       # Endpoints para scraping
     ├── core/
+    │   ├── base.py                  # Base para modelos
     │   ├── config.py                # Settings desde .env
     │   ├── database.py              # SQLAlchemy engine + sesiones
-    │   └── scheduler.py            # APScheduler para scraping periódico
+    │   └── scheduler.py             # APScheduler para scraping periódico
     ├── models/
-    │   ├── models.py                # Tablas: Store, Product, SearchLog
+    │   ├── models.py                # Tablas: Store, Product, etc.
     │   └── schemas.py               # Schemas Pydantic (request/response)
-    ├── services/
-    │   ├── ai_classifier.py         # Clasificación con Claude API
-    │   ├── scraping_service.py      # Orquestador de scraping + guardado
-    │   └── search_service.py        # Lógica de búsqueda en DB
-    └── scrapers/
-        └── base_scraper.py          # Scraper genérico + utilidades
+    ├── scrapers/
+    │   ├── base_scraper.py          # Scraper genérico + utilidades
+    │   ├── tiendanube_scraper.py    # Scraper específico para Tiendanube
+    │   ├── tiendanube_selenium_scraper.py  # Scraper con Selenium para Tiendanube
+    │   └── woocommerce_scraper.py   # Scraper para WooCommerce
+    │   
+    └── services/
+        ├── ai_classifier.py         # Clasificación con Claude API
+        ├── enrichment_service.py    # Servicio de enriquecimiento de datos
+        ├── scraping_service.py      # Orquestador de scraping + guardado
+        └── search_service.py        # Lógica de búsqueda en DB
 ```
 
 ## Setup

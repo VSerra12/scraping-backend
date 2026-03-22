@@ -15,14 +15,19 @@ class Settings(BaseSettings):
     # IA
     AI_MODEL: str = "claude-sonnet-4-20250514"
     AI_MAX_TOKENS: int = 500
-    AI_BATCH_SIZE: int = 10   # productos por llamada de clasificación
+    AI_BATCH_SIZE: int = 10
 
     # Búsqueda
     DEFAULT_SEARCH_LIMIT: int = 20
     MAX_SEARCH_LIMIT: int = 50
 
-    # Scheduler (horas entre scraping automático)
+    # Scheduler
     SCRAPE_INTERVAL_HOURS: int = 24
+
+    # Auth admin
+    ADMIN_USERNAME: str = "administrador"
+    ADMIN_PASSWORD: str = "tu_password_seguro"
+    SECRET_KEY: str = "dev-secret-key-change-in-production"
 
     class Config:
         env_file = ".env"

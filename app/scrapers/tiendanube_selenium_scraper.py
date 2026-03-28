@@ -1,6 +1,9 @@
 """
 Scraper Selenium para tiendas Tienda Nube con scroll infinito (JS-heavy).
-Úsalo cuando requests+BS4 solo devuelve 12 productos.
+
+ESTRATEGIA:
+- Con last_mpage: abre mpage=1..N con un solo driver, extrae ~12 productos por página.
+- Sin last_mpage: scroll incremental desde la URL base.
 
 Requiere: pip install selenium webdriver-manager
 """
@@ -21,7 +24,6 @@ logger = logging.getLogger(__name__)
 
 
 def _get_driver() -> webdriver.Chrome:
-    """Inicializa Chrome headless."""
     options = Options()
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
@@ -37,42 +39,6 @@ def _get_driver() -> webdriver.Chrome:
     service = Service(ChromeDriverManager().install())
     driver = webdriver.Chrome(service=service, options=options)
     return driver
-
-
-def _scroll_to_bottom(driver: webdriver.Chrome, pause: float = 2.5) -> int:
-    """
-    Hace scroll incremental para disparar el lazy loading de Tienda Nube.
-    Cada 12 productos nuevos = 1 página cargada.
-    Devuelve el total de productos encontrados.
-    """
-    last_count = 0
-    no_change_streak = 0
-    max_no_change = 5  # esperar más antes de rendirse
-
-    while True:
-        items = driver.find_elements(By.CSS_SELECTOR, ".js-item-product")
-        current_count = len(items)
-        logger.info(f"  Scroll: {current_count} productos cargados...")
-
-        if current_count == last_count:
-            no_change_streak += 1
-            if no_change_streak >= max_no_change:
-                break
-            # Scroll más agresivo cuando no cambia
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(pause + 1)
-        else:
-            no_change_streak = 0
-            last_count = current_count
-            # Scroll incremental para triggear lazy load
-            current_height = driver.execute_script("return document.body.scrollHeight")
-            # Scroll a 80% del height para que el trigger de "casi al fondo" active la carga
-            driver.execute_script(f"window.scrollTo(0, {int(current_height * 0.8)});")
-            time.sleep(0.5)
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(pause)
-
-    return last_count
 
 
 def _get_base_url(url: str) -> str:
@@ -97,7 +63,6 @@ def _parse_price(text: str) -> Optional[float]:
 
 
 def _extract_price_from_variants(item) -> Optional[float]:
-    """Extrae precio del atributo data-variants."""
     raw = item.get("data-variants") or ""
     if not raw:
         child = item.select_one("[data-variants]")
@@ -117,8 +82,6 @@ def _extract_price_from_variants(item) -> Optional[float]:
 def _extract_single(item, base_url: str) -> Optional[dict]:
     try:
         external_id = item.get("data-product-id")
-
-        # Título
         title_el = item.select_one(".js-item-name, .item-name")
         if not title_el:
             return None
@@ -126,10 +89,12 @@ def _extract_single(item, base_url: str) -> Optional[dict]:
         if not title:
             return None
 
-        # URL
         product_url = None
-        for sel in ["a.product-item-link", "a.item-link", "a.js-product-item-image-link-private",
-                    "a[href*='/productos/']", "a[href*='/product']"]:
+        for sel in [
+            "a.product-item-link", "a.item-link",
+            "a.js-product-item-image-link-private",
+            "a[href*='/productos/']", "a[href*='/product']"
+        ]:
             link_el = item.select_one(sel)
             if link_el and link_el.get("href"):
                 href = link_el["href"]
@@ -138,23 +103,18 @@ def _extract_single(item, base_url: str) -> Optional[dict]:
         if not product_url:
             return None
 
-        # Precio
         price = _extract_price_from_variants(item)
         if price is None:
             price_el = item.select_one(".js-price-display, .item-price, .price")
             if price_el:
                 price = _parse_price(price_el.get_text(strip=True))
 
-        # Imagen — buscar la primera img con src real (no base64/placeholder)
         image_url = None
         for img in item.find_all("img"):
-            # Intentar src primero
             src = img.get("src") or ""
-            # Si es base64/placeholder, intentar srcset o data-srcset
             if not src or src.startswith("data:") or "placeholder" in src:
                 srcset = img.get("srcset") or img.get("data-srcset") or ""
                 if srcset:
-                    # Tomar la URL más grande del srcset (último entry)
                     entries = [s.strip().split()[0] for s in srcset.split(",") if s.strip()]
                     src = entries[-1] if entries else ""
             if not src or src.startswith("data:"):
@@ -179,53 +139,141 @@ def _extract_single(item, base_url: str) -> Optional[dict]:
         return None
 
 
-def scrape_with_selenium(catalog_url: str) -> list[dict]:
+def scrape_with_selenium(catalog_url: str, last_mpage: int = None) -> list[dict]:
     """
-    Scrapea una tienda Tienda Nube con scroll infinito usando Selenium.
-    Úsalo como reemplazo de TiendaNubeScraper.scrape_store() para tiendas JS-heavy.
-    """
-    # Usar la URL base sin parámetros de paginación (el scroll carga todo)
-    base_catalog = catalog_url.split("?")[0].rstrip("/") + "/"
-    base_url = _get_base_url(catalog_url)
+    Scrapea una tienda Tienda Nube con Selenium.
 
-    logger.info(f"Iniciando Selenium para: {base_catalog}")
+    Con last_mpage: itera mpage=1..N con un solo driver (~12 productos por página).
+    Sin last_mpage: scroll incremental desde la URL base.
+    """
+    base_url = _get_base_url(catalog_url)
+    base_catalog = catalog_url.split("?")[0].rstrip("/") + "/"
+
+    if last_mpage:
+        logger.info(f"Iniciando Selenium iterando mpage=1..{last_mpage}: {base_catalog}")
+        return _scrape_all_mpages_selenium(base_catalog, base_url, last_mpage)
+    else:
+        logger.info(f"Iniciando Selenium con scroll desde: {base_catalog}")
+        return _scrape_with_scroll(base_catalog, base_url)
+
+
+def _scrape_all_mpages_selenium(base_catalog: str, base_url: str, last_mpage: int) -> list[dict]:
+    """
+    Itera todas las mpage con un solo driver reutilizado.
+    Cada página carga ~12 productos distintos con JS.
+    """
+    driver = _get_driver()
+    all_products = []
+    seen_ids = set()
+    consecutive_empty = 0
+
+    try:
+        for page in range(1, last_mpage + 1):
+            url = f"{base_catalog}?mpage={page}"
+            logger.info(f"  Selenium mpage={page}/{last_mpage}")
+
+            driver.get(url)
+
+            # Esperar que carguen los productos de esta página
+            try:
+                WebDriverWait(driver, 12).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, ".js-item-product"))
+                )
+            except Exception:
+                logger.warning(f"  Timeout en mpage={page}, saltando")
+                consecutive_empty += 1
+                if consecutive_empty >= 3:
+                    logger.warning("3 páginas seguidas sin respuesta, deteniendo")
+                    break
+                continue
+
+            # Pequeña pausa para que termine el render
+            time.sleep(1.5)
+
+            soup = BeautifulSoup(driver.page_source, "html.parser")
+            items = soup.select(".js-item-product")
+
+            if not items:
+                consecutive_empty += 1
+                logger.warning(f"  mpage={page}: sin items en el DOM")
+                if consecutive_empty >= 3:
+                    break
+                continue
+
+            consecutive_empty = 0
+            new_count = 0
+            for item in items:
+                product = _extract_single(item, base_url)
+                if not product:
+                    continue
+                key = product.get("external_id") or product.get("product_url")
+                if key not in seen_ids:
+                    seen_ids.add(key)
+                    all_products.append(product)
+                    new_count += 1
+
+            logger.info(f"  → {new_count} nuevos en mpage={page} (total: {len(all_products)})")
+
+            # Si una página no aporta nada nuevo, probablemente llegamos al final
+            if new_count == 0 and page > 1:
+                consecutive_empty += 1
+                if consecutive_empty >= 2:
+                    logger.info(f"Sin productos nuevos en {consecutive_empty} páginas consecutivas, deteniendo")
+                    break
+            else:
+                consecutive_empty = 0
+
+    except Exception as e:
+        logger.error(f"Error en Selenium mpage iteration: {e}")
+    finally:
+        driver.quit()
+
+    logger.info(f"Total extraídos con Selenium: {len(all_products)}")
+    return all_products
+
+
+def _scrape_with_scroll(base_catalog: str, base_url: str) -> list[dict]:
+    """Scroll incremental cuando no se conoce la cantidad de páginas."""
     driver = _get_driver()
     products = []
 
     try:
         driver.get(base_catalog)
-
-        # Esperar a que carguen los primeros productos
         try:
             WebDriverWait(driver, 15).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, ".js-item-product"))
             )
         except Exception:
-            logger.warning("Timeout esperando productos — intentando igual")
+            logger.warning("Timeout esperando productos")
 
-        # Scroll hasta el fondo
-        total = _scroll_to_bottom(driver, pause=2.0)
-        logger.info(f"Scroll completo: {total} productos visibles")
+        # Scroll incremental
+        last_count = 0
+        no_change = 0
+        while no_change < 4:
+            items = driver.find_elements(By.CSS_SELECTOR, ".js-item-product")
+            current = len(items)
+            logger.info(f"  Scroll: {current} productos")
+            if current > last_count:
+                last_count = current
+                no_change = 0
+                try:
+                    driver.execute_script(
+                        "arguments[0].scrollIntoView({block:'center'});", items[-1]
+                    )
+                    time.sleep(0.5)
+                except Exception:
+                    pass
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                time.sleep(3)
+            else:
+                no_change += 1
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                time.sleep(3)
 
-        # Forzar carga de imágenes lazy — scroll suave desde arriba
-        driver.execute_script("window.scrollTo(0, 0);")
-        time.sleep(1)
-        height = driver.execute_script("return document.body.scrollHeight")
-        step = 400
-        pos = 0
-        while pos < height:
-            driver.execute_script(f"window.scrollTo(0, {pos});")
-            pos += step
-            time.sleep(0.15)
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(2)
+        logger.info(f"Scroll completo: {last_count} productos")
 
-        # Parsear el HTML final
         soup = BeautifulSoup(driver.page_source, "html.parser")
-        items = soup.select(".js-item-product")
-        logger.info(f"Extrayendo {len(items)} productos...")
-
-        for item in items:
+        for item in soup.select(".js-item-product"):
             product = _extract_single(item, base_url)
             if product:
                 products.append(product)
@@ -233,7 +281,7 @@ def scrape_with_selenium(catalog_url: str) -> list[dict]:
         logger.info(f"Total extraídos: {len(products)}")
 
     except Exception as e:
-        logger.error(f"Error en Selenium scraper: {e}")
+        logger.error(f"Error en Selenium scroll scraper: {e}")
     finally:
         driver.quit()
 

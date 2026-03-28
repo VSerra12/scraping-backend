@@ -1,14 +1,12 @@
 """
 Scraper para tiendas en plataforma Tienda Nube (mitiendanube.com).
-Usada por muchas tiendas argentinas como Leur, etc.
 
-Selectores basados en la estructura de Tienda Nube:
-- Contenedor: .js-item-product
-- Título: .item-name
-- Precio: .item-price
-- Imagen: img.product-item-image-featured
-- Link: a.item-link
-- ID externo: data-product-id
+ESTRATEGIA:
+- Si la URL tiene ?mpage=N: Tienda Nube renderiza el contenido con JS.
+  requests+BS4 solo ve los primeros 12 productos del HTML estático.
+  → Ir directo a Selenium, que itera mpage=1..N abriendo cada página.
+- Si no tiene ?mpage: intentar requests primero, detectar si hay mpage,
+  y si no, usar paginación normal ?page=N.
 """
 import json
 import logging
@@ -21,16 +19,6 @@ logger = logging.getLogger(__name__)
 
 
 def _split_title_color(title: str) -> tuple[str, str | None]:
-    """
-    Detecta patrones de variante de color en el título.
-    Ejemplos:
-      "remera emily // negro" → ("remera emily", "negro")
-      "top claire // choco"   → ("top claire", "choco")
-      "jean recto azul"       → ("jean recto azul", None)
-    Separadores soportados: //, -, |, colores al final
-    """
-    import re
-    # Patrón principal: nombre // color
     if "//" in title:
         parts = title.split("//", 1)
         return parts[0].strip(), parts[1].strip()
@@ -38,174 +26,150 @@ def _split_title_color(title: str) -> tuple[str, str | None]:
 
 
 class TiendaNubeScraper(BaseScraper):
-    """Scraper específico para tiendas en plataforma Tienda Nube."""
 
     def scrape_store(self, catalog_url: str, max_pages: int = None) -> list[dict]:
         max_pages = max_pages or settings.MAX_PAGES_PER_STORE
-        products = []
-        seen_ids = set()
         base_url = self._get_base_url(catalog_url)
 
-        # Analizar la URL para detectar el tipo de paginación y página máxima
         pagination = self._parse_pagination_from_url(catalog_url)
         logger.info(f"Paginación parseada: {pagination}")
         base_catalog_url = pagination["base_url"]
-        page_param = pagination["param"]   # "mpage", "page", o None
-        last_page = pagination["last_page"] # número si está en la URL, sino None
+        page_param = pagination["param"]
+        last_page = pagination["last_page"]
 
-        if page_param == "mpage":
-            # Scroll infinito JS — usar Selenium directamente
-            logger.info("Scroll infinito (mpage) detectado — usando Selenium")
-            products = self._scrape_with_selenium(base_catalog_url)
+        # ── Caso 1: URL tiene ?mpage=N → Selenium directo ────────────────────
+        # requests+BS4 solo ve 12 productos del HTML estático.
+        # Selenium ejecuta el JS y ve los productos reales de cada página.
+        if page_param == "mpage" and last_page:
+            logger.info(f"mpage={last_page} detectado — usando Selenium (JS requerido)")
+            products = self._scrape_with_selenium(base_catalog_url, last_mpage=last_page)
+            logger.info(f"Total productos scrapeados: {len(products)}")
+            return products
+
+        # ── Caso 2: Sin parámetro → detectar tipo de paginación ──────────────
         elif page_param is None:
-            # Sin parámetro — probar requests primero, si solo da 12 usar Selenium
             soup = self.get_page(base_catalog_url)
-            if soup:
-                initial = self._extract_products(soup, base_url)
-                if len(initial) < 13 and self._detect_mpage(base_catalog_url, base_url):
-                    logger.info("JS scroll infinito detectado — usando Selenium")
-                    products = self._scrape_with_selenium(base_catalog_url)
-                else:
-                    products = initial
-                    # Continuar con paginación normal si hay más páginas
-                    for page_num in range(2, max_pages + 1):
-                        url = f"{base_catalog_url}?page={page_num}"
-                        soup = self.get_page(url)
-                        if not soup:
-                            break
-                        page_products = self._extract_products(soup, base_url)
-                        if not page_products:
-                            break
-                        new_ps = [p for p in page_products
-                                  if (p.get("external_id") or p.get("product_url")) not in seen_ids]
-                        if not new_ps:
-                            break
-                        for p in new_ps:
-                            seen_ids.add(p.get("external_id") or p.get("product_url"))
-                        products.extend(new_ps)
-                        if not self._has_next_page(soup):
-                            break
+            if not soup:
+                logger.warning(f"No se pudo obtener: {base_catalog_url}")
+                return []
+
+            initial = self._extract_products(soup, base_url)
+            logger.info(f"Primera página con requests: {len(initial)} productos")
+
+            # Verificar si hay mpage=2 con productos distintos
+            last_mpage = self._detect_last_mpage(base_catalog_url, base_url, initial)
+
+            if last_mpage and last_mpage > 1:
+                logger.info(f"mpage detectado — usando Selenium para {last_mpage} páginas")
+                products = self._scrape_with_selenium(base_catalog_url, last_mpage=last_mpage)
+                logger.info(f"Total productos scrapeados: {len(products)}")
+                return products
             else:
-                page_param = "page"  # fallback a paginación normal
-                for page_num in range(1, max_pages + 1):
-                    url = base_catalog_url if page_num == 1 else f"{base_catalog_url}?page={page_num}"
-                    logger.info(f"Scrapeando página {page_num}: {url}")
+                # Paginación normal ?page=N con requests
+                products = list(initial)
+                seen_ids = {p.get("external_id") or p.get("product_url") for p in initial}
+
+                for page_num in range(2, max_pages + 1):
+                    url = f"{base_catalog_url}?page={page_num}"
                     soup = self.get_page(url)
                     if not soup:
                         break
                     page_products = self._extract_products(soup, base_url)
                     if not page_products:
                         break
-                    products.extend(page_products)
-                    logger.info(f"  → {len(page_products)} productos (total: {len(products)})")
+                    new_ps = [
+                        p for p in page_products
+                        if (p.get("external_id") or p.get("product_url")) not in seen_ids
+                    ]
+                    if not new_ps:
+                        break
+                    for p in new_ps:
+                        seen_ids.add(p.get("external_id") or p.get("product_url"))
+                    products.extend(new_ps)
+                    logger.info(f"  → {len(new_ps)} nuevos (total: {len(products)})")
                     if not self._has_next_page(soup):
                         break
-        else:
-            # Paginación normal (?page=N): iterar página por página
-            for page_num in range(1, max_pages + 1):
-                if page_num == 1:
-                    url = base_catalog_url
-                else:
-                    param = page_param or "page"
-                    url = f"{base_catalog_url}?{param}={page_num}"
-                logger.info(f"Scrapeando página {page_num}: {url}")
 
+                logger.info(f"Total productos scrapeados: {len(products)}")
+                return products
+
+        # ── Caso 3: ?page=N normal con requests ──────────────────────────────
+        else:
+            products = []
+            seen_ids = set()
+
+            for page_num in range(1, max_pages + 1):
+                url = base_catalog_url if page_num == 1 else f"{base_catalog_url}?{page_param}={page_num}"
+                logger.info(f"Scrapeando página {page_num}: {url}")
                 soup = self.get_page(url)
                 if not soup:
-                    logger.warning(f"No se pudo obtener página {page_num}")
                     break
-
-                items_count = len(soup.select(".js-item-product"))
-                logger.info(f"  → {items_count} items encontrados en soup")
-
                 page_products = self._extract_products(soup, base_url)
                 if not page_products:
-                    logger.info(f"Sin productos en página {page_num}, deteniendo.")
                     break
-
                 new_products = []
                 for p in page_products:
                     key = p.get("external_id") or p.get("product_url")
                     if key not in seen_ids:
                         seen_ids.add(key)
                         new_products.append(p)
-
                 if not new_products:
-                    logger.info(f"Página {page_num} sin productos nuevos, deteniendo.")
                     break
-
                 products.extend(new_products)
-                logger.info(f"  → {len(new_products)} productos nuevos (total: {len(products)})")
-
+                logger.info(f"  → {len(new_products)} nuevos (total: {len(products)})")
                 if not self._has_next_page(soup):
                     break
 
-        logger.info(f"Total productos scrapeados: {len(products)}")
-        return products
+            logger.info(f"Total productos scrapeados: {len(products)}")
+            return products
+
+    def _detect_last_mpage(self, catalog_url: str, base_url: str, initial_products: list) -> Optional[int]:
+        """Detecta si la tienda usa mpage y encuentra la última página."""
+        try:
+            soup2 = self.get_page(f"{catalog_url}?mpage=2")
+            if not soup2:
+                return None
+            page2 = self._extract_products(soup2, base_url)
+            if not page2:
+                return None
+
+            known = {p.get("external_id") or p.get("product_url") for p in initial_products}
+            new_in_page2 = [
+                p for p in page2
+                if (p.get("external_id") or p.get("product_url")) not in known
+            ]
+            if not new_in_page2:
+                return None
+
+            logger.info(f"mpage=2 tiene {len(new_in_page2)} productos nuevos → buscando última página")
+
+            last_valid = 2
+            for page in range(3, 101):
+                soup = self.get_page(f"{catalog_url}?mpage={page}")
+                if not soup or not soup.select(".js-item-product"):
+                    break
+                last_valid = page
+
+            logger.info(f"Última mpage encontrada: {last_valid}")
+            return last_valid
+
+        except Exception as e:
+            logger.debug(f"Error en _detect_last_mpage: {e}")
+            return None
 
     def _parse_pagination_from_url(self, catalog_url: str) -> dict:
-        """
-        Extrae info de paginación de la URL del catálogo via regex.
-        Ejemplos:
-          https://leur.com.ar/productos/?mpage=14  → {param: mpage, last_page: 14}
-          https://tienda.com/shop/?page=3          → {param: page, last_page: 3}
-          https://tienda.com/productos/            → {param: None, last_page: None}
-        """
         import re
         base = catalog_url.split("?")[0].rstrip("/") + "/"
-
         for param in ["mpage", "page"]:
             match = re.search(r"[?&]" + param + r"=(\d+)", catalog_url)
             if match:
                 return {"base_url": base, "param": param, "last_page": int(match.group(1))}
-
         return {"base_url": base, "param": None, "last_page": None}
 
-    def _detect_mpage(self, catalog_url: str, base_url: str) -> bool:
-        """Detecta si la tienda usa ?mpage= para paginación (scroll infinito)."""
-        try:
-            test_url = f"{catalog_url}?mpage=2"
-            soup = self.get_page(test_url)
-            if soup and len(soup.select(".js-item-product")) > 0:
-                return True
-        except Exception:
-            pass
-        return False
-
-    def _find_last_mpage(self, catalog_url: str, base_url: str) -> int:
-        """
-        Encuentra la última página de scroll infinito buscando binariamente.
-        En Tienda Nube con mpage, cada página acumula todos los anteriores,
-        así que la última página tiene el catálogo completo.
-        """
-        # Buscar la última página válida entre 1 y 50
-        last_valid = 1
-        last_count = 0
-
-        for page in range(1, 51):
-            url = f"{catalog_url}?mpage={page}"
-            try:
-                soup = self.get_page(url)
-                if not soup:
-                    break
-                count = len(soup.select(".js-item-product"))
-                if count == 0 or count == last_count:
-                    # Sin productos nuevos — página anterior era la última
-                    break
-                last_count = count
-                last_valid = page
-                logger.info(f"  mpage={page}: {count} items acumulados")
-            except Exception:
-                break
-
-        logger.info(f"Última mpage encontrada: {last_valid} ({last_count} productos)")
-        return last_valid
-
-    def _scrape_with_selenium(self, catalog_url: str) -> list[dict]:
-        """Delega al scraper Selenium para tiendas con scroll infinito JS."""
+    def _scrape_with_selenium(self, catalog_url: str, last_mpage: int = None) -> list[dict]:
         try:
             from app.scrapers.tiendanube_selenium_scraper import scrape_with_selenium
-            return scrape_with_selenium(catalog_url)
+            return scrape_with_selenium(catalog_url, last_mpage=last_mpage)
         except ImportError:
             logger.error("selenium no instalado — ejecutá: pip install selenium webdriver-manager")
             return []
@@ -216,9 +180,7 @@ class TiendaNubeScraper(BaseScraper):
     def _extract_products(self, soup: BeautifulSoup, base_url: str) -> list[dict]:
         items = soup.select(".js-item-product")
         if not items:
-            logger.debug("No se encontraron .js-item-product")
             return []
-
         products = []
         for item in items:
             product = self._extract_single(item, base_url)
@@ -228,10 +190,7 @@ class TiendaNubeScraper(BaseScraper):
 
     def _extract_single(self, item, base_url: str) -> Optional[dict]:
         try:
-            # ID externo
             external_id = item.get("data-product-id")
-
-            # Título — .js-item-name (Hugs) o .item-name (Leur)
             title_el = item.select_one(".js-item-name, .item-name")
             if not title_el:
                 return None
@@ -239,9 +198,13 @@ class TiendaNubeScraper(BaseScraper):
             if not title:
                 return None
 
-            # URL del producto — múltiples fallbacks
             product_url = None
-            for link_sel in ["a.product-item-link", "a.item-link", "a.js-product-item-image-link-private", "a[href*='/productos/']", "a[href*='/product']", "h2 a", "h3 a"]:
+            for link_sel in [
+                "a.product-item-link", "a.item-link",
+                "a.js-product-item-image-link-private",
+                "a[href*='/productos/']", "a[href*='/product']",
+                "h2 a", "h3 a"
+            ]:
                 link_el = item.select_one(link_sel)
                 if link_el and link_el.get("href"):
                     href = link_el["href"]
@@ -250,15 +213,12 @@ class TiendaNubeScraper(BaseScraper):
             if not product_url:
                 return None
 
-            # Precio — intentar desde data-variants primero (más confiable)
             price = self._extract_price_from_variants(item)
             if price is None:
                 price_el = item.select_one(".item-price")
                 if price_el:
                     price = self._parse_price(price_el.get_text(strip=True))
 
-            # Imagen — intentar data-variants primero (tiene URL real),
-            # luego srcset, luego src
             image_url = self._extract_image_from_variants(item)
             if not image_url:
                 for img in item.find_all("img"):
@@ -279,7 +239,6 @@ class TiendaNubeScraper(BaseScraper):
                     image_url = src
                     break
 
-            # Detectar patrón nombre // color
             base_title, color_variant = _split_title_color(title)
 
             return {
@@ -293,15 +252,11 @@ class TiendaNubeScraper(BaseScraper):
             }
 
         except Exception as e:
-            logger.debug(f"Error extrayendo producto Tienda Nube: {e}")
+            logger.debug(f"Error extrayendo producto: {e}")
             return None
 
     def _extract_image_from_variants(self, item) -> Optional[str]:
-        """Extrae image_url del atributo data-variants (evita placeholders lazy)."""
-        if item.get("data-variants"):
-            container = item
-        else:
-            container = item.select_one("[data-variants]")
+        container = item if item.get("data-variants") else item.select_one("[data-variants]")
         if not container:
             return None
         try:
@@ -309,23 +264,13 @@ class TiendaNubeScraper(BaseScraper):
             if variants and isinstance(variants, list):
                 img = variants[0].get("image_url", "")
                 if img:
-                    if img.startswith("//"):
-                        img = "https:" + img
-                    return img
+                    return "https:" + img if img.startswith("//") else img
         except (json.JSONDecodeError, KeyError, TypeError):
             pass
         return None
 
     def _extract_price_from_variants(self, item) -> Optional[float]:
-        """Extrae precio del atributo data-variants (más confiable que el HTML).
-        En algunas tiendas (ej: Hugs) el atributo está en el item mismo,
-        en otras está en un hijo.
-        """
-        # Primero intentar en el item mismo
-        if item.get("data-variants"):
-            container = item
-        else:
-            container = item.select_one("[data-variants]")
+        container = item if item.get("data-variants") else item.select_one("[data-variants]")
         if not container:
             return None
         try:
@@ -338,9 +283,7 @@ class TiendaNubeScraper(BaseScraper):
         return None
 
     def _has_next_page(self, soup: BeautifulSoup) -> bool:
-        """Verifica si existe página siguiente."""
-        next_link = soup.select_one("a[rel='next'], .pagination .next, li.next a")
-        return next_link is not None
+        return bool(soup.select_one("a[rel='next'], .pagination .next, li.next a"))
 
     def _get_base_url(self, url: str) -> str:
         from urllib.parse import urlparse

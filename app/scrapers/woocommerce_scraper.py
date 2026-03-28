@@ -168,7 +168,6 @@ class WooCommerceScraper(BaseScraper):
                 if len(parts) == 2 and len(parts[1]) == 3:
                     cleaned = cleaned.replace(".", "")
             result = float(cleaned)
-            logger.info(f"[PRICE DEBUG] result={result}")
             return result
         except ValueError:
             return None

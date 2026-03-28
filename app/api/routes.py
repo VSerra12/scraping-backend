@@ -1,13 +1,15 @@
-from fastapi import APIRouter, Depends, HTTPException
+from __future__ import annotations
+
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import func
-from typing import List
 from app.core.database import get_db
-from app.models.models import Store, Product, SearchLog
+from app.models.models import Store, Product, SearchLog, ScrapeLog
 from app.models.schemas import (
     StoreCreate, StoreRead,
     SearchRequest, SearchResponse,
     ScrapeResponse, StatsResponse,
+    ScrapeLogRead, StoreEnrichStatus,
 )
 from app.services.scraping_service import scrape_and_save
 from app.services.search_service import search_products
@@ -20,7 +22,7 @@ router.include_router(auth_router)
 router.include_router(ai_router)
 
 
-# ─── Stores (públicos — solo lectura) ─────────────────────────────────────────
+# ─── Stores ────────────────────────────────────────────────────────────────────
 
 @router.post("/stores", response_model=StoreRead, status_code=201, tags=["Tiendas"])
 def create_store(store_data: StoreCreate, db: Session = Depends(get_db), _: dict = Depends(require_admin)):
@@ -34,7 +36,7 @@ def create_store(store_data: StoreCreate, db: Session = Depends(get_db), _: dict
     return store
 
 
-@router.get("/stores", response_model=List[StoreRead], tags=["Tiendas"])
+@router.get("/stores", response_model=list[StoreRead], tags=["Tiendas"])
 def list_stores(location: str = None, db: Session = Depends(get_db)):
     query = db.query(Store)
     if location:
@@ -74,7 +76,7 @@ def toggle_store_active(store_id: int, db: Session = Depends(get_db), _: dict = 
     return store
 
 
-# ─── Scraping (protegido) ──────────────────────────────────────────────────────
+# ─── Scraping ──────────────────────────────────────────────────────────────────
 
 @router.post("/scrape/{store_id}", response_model=ScrapeResponse, tags=["Scraping"])
 def scrape_store(
@@ -90,7 +92,7 @@ def scrape_store(
     return scrape_and_save(store, db)
 
 
-@router.post("/scrape-all", response_model=List[ScrapeResponse], tags=["Scraping"])
+@router.post("/scrape-all", response_model=list[ScrapeResponse], tags=["Scraping"])
 def scrape_all_stores(
     db: Session = Depends(get_db),
     _: dict = Depends(require_admin),
@@ -101,7 +103,35 @@ def scrape_all_stores(
     return [scrape_and_save(store, db) for store in stores]
 
 
-# ─── Enriquecimiento (protegido) ───────────────────────────────────────────────
+@router.get(
+    "/scrape-logs/{store_id}",
+    response_model=list[ScrapeLogRead],
+    tags=["Scraping"],
+)
+def get_scrape_logs(
+    store_id: int,
+    limit: int = Query(default=10, ge=1, le=100),
+    db: Session = Depends(get_db),
+):
+    """
+    Devuelve los últimos N runs de scraping para una tienda (default 10).
+    Público — el front lo usa para mostrar historial y detectar errores.
+    """
+    store = db.query(Store).filter(Store.id == store_id).first()
+    if not store:
+        raise HTTPException(status_code=404, detail="Tienda no encontrada")
+
+    logs = (
+        db.query(ScrapeLog)
+        .filter(ScrapeLog.store_id == store_id)
+        .order_by(ScrapeLog.started_at.desc())
+        .limit(limit)
+        .all()
+    )
+    return logs
+
+
+# ─── Enriquecimiento ───────────────────────────────────────────────────────────
 
 @router.post("/enrich", tags=["Scraping"])
 def enrich_products(
@@ -122,27 +152,57 @@ def enrich_products(
     }
 
 
-@router.get("/enrich/status", tags=["Scraping"])
+@router.get(
+    "/enrich/status",
+    tags=["Scraping"],
+)
 def enrichment_status(db: Session = Depends(get_db)):
-    """Público — el front lo usa para mostrar el progreso."""
+    """
+    Público — el front lo usa para mostrar progreso de enriquecimiento.
+    Incluye el último scrape log de cada tienda para que el front
+    pueda mostrar estado del scraping sin un request extra.
+    """
     global_status = get_enrichment_status(db)
     stores = db.query(Store).all()
-    by_store = []
+
+    # Precarga el último log de cada tienda en una sola query
+    latest_logs: dict[int, ScrapeLog] = {}
+    subq = (
+        db.query(
+            ScrapeLog.store_id,
+            func.max(ScrapeLog.started_at).label("max_started"),
+        )
+        .group_by(ScrapeLog.store_id)
+        .subquery()
+    )
+    for log in (
+        db.query(ScrapeLog)
+        .join(subq, (ScrapeLog.store_id == subq.c.store_id) &
+                    (ScrapeLog.started_at == subq.c.max_started))
+        .all()
+    ):
+        latest_logs[log.store_id] = log
+
+    by_store: list[StoreEnrichStatus] = []
     for store in stores:
-        total = db.query(Product).filter(Product.store_id == store.id).count()
-        enriched = db.query(Product).filter(Product.store_id == store.id, Product.enriched == True).count()  # noqa: E712
+        total      = db.query(Product).filter(Product.store_id == store.id).count()
+        enriched   = db.query(Product).filter(Product.store_id == store.id, Product.enriched == True).count()       # noqa: E712
         classified = db.query(Product).filter(Product.store_id == store.id, Product.ai_classified == True).count()  # noqa: E712
-        pending = total - enriched
-        by_store.append({
-            "store_id": store.id,
-            "store_name": store.name,
-            "total": total,
-            "enriched": enriched,
-            "classified": classified,
-            "pending": pending,
-            "percent": round((enriched / total * 100) if total > 0 else 0, 1),
-        })
-    return {**global_status, "by_store": by_store}
+        pending    = total - enriched
+        last_log   = latest_logs.get(store.id)
+
+        by_store.append(StoreEnrichStatus(
+            store_id=store.id,
+            store_name=store.name,
+            total=total,
+            enriched=enriched,
+            classified=classified,
+            pending=pending,
+            percent=round((enriched / total * 100) if total > 0 else 0, 1),
+            last_scrape=ScrapeLogRead.model_validate(last_log) if last_log else None,
+        ))
+
+    return {**global_status, "by_store": [s.model_dump() for s in by_store]}
 
 
 @router.post("/enrich/{store_id}", tags=["Scraping"])
@@ -165,24 +225,24 @@ def enrich_store(
     }
 
 
-# ─── Búsqueda (pública) ────────────────────────────────────────────────────────
+# ─── Búsqueda ──────────────────────────────────────────────────────────────────
 
 @router.post("/search", response_model=SearchResponse, tags=["Búsqueda"])
 def search(request: SearchRequest, db: Session = Depends(get_db)):
     return search_products(request, db)
 
 
-# ─── Estadísticas (públicas) ───────────────────────────────────────────────────
+# ─── Estadísticas ──────────────────────────────────────────────────────────────
 
 @router.get("/stats", response_model=StatsResponse, tags=["Estadísticas"])
 def get_stats(db: Session = Depends(get_db)):
-    total_stores = db.query(Store).count()
-    active_stores = db.query(Store).filter(Store.active == True).count()  # noqa: E712
-    total_products = db.query(Product).count()
+    total_stores        = db.query(Store).count()
+    active_stores       = db.query(Store).filter(Store.active == True).count()         # noqa: E712
+    total_products      = db.query(Product).count()
     classified_products = db.query(Product).filter(Product.ai_classified == True).count()  # noqa: E712
-    enriched_products = db.query(Product).filter(Product.enriched == True).count()  # noqa: E712
-    pending_enrichment = db.query(Product).filter(Product.enriched == False).count()  # noqa: E712
-    total_searches = db.query(SearchLog).count()
+    enriched_products   = db.query(Product).filter(Product.enriched == True).count()   # noqa: E712
+    pending_enrichment  = db.query(Product).filter(Product.enriched == False).count()  # noqa: E712
+    total_searches      = db.query(SearchLog).count()
     return StatsResponse(
         total_stores=total_stores,
         active_stores=active_stores,

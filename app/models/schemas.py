@@ -1,5 +1,7 @@
+from __future__ import annotations
+
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional
 from pydantic import BaseModel, field_validator
 
 
@@ -53,13 +55,13 @@ class ProductRead(BaseModel):
 
     # Info enriquecida
     materials_raw: Optional[str] = None
-    sizes: Optional[List[str]] = None
+    sizes: Optional[list[str]] = None
 
     # Clasificación base
     category: Optional[str] = None
     subcategory: Optional[str] = None
-    colors: Optional[List[str]] = None
-    style_tags: Optional[List[str]] = None
+    colors: Optional[list[str]] = None
+    style_tags: Optional[list[str]] = None
     gender: Optional[str] = None
 
     # Clasificación expandida
@@ -67,13 +69,13 @@ class ProductRead(BaseModel):
     leg_cut:  Optional[str] = None
     rise:     Optional[str] = None
     length:   Optional[str] = None
-    materials: Optional[List[str]] = None
+    materials: Optional[list[str]] = None
     texture: Optional[str] = None
     thickness: Optional[str] = None
     stretch: Optional[bool] = None
-    colors_secondary: Optional[List[str]] = None
+    colors_secondary: Optional[list[str]] = None
     pattern: Optional[str] = None
-    design_details: Optional[List[str]] = None
+    design_details: Optional[list[str]] = None
     neck_type: Optional[str] = None
     sleeve_type: Optional[str] = None
     hem_finish: Optional[str] = None
@@ -84,7 +86,7 @@ class ProductRead(BaseModel):
     enriched: bool = False
     ai_classified: bool = False
 
-    variants: List[VariantRead] = []
+    variants: list[VariantRead] = []
 
     model_config = {"from_attributes": True}
 
@@ -101,26 +103,26 @@ class ProductSummary(BaseModel):
     store_name: Optional[str] = None
     category: Optional[str] = None
     subcategory: Optional[str] = None
-    colors: Optional[List[str]] = None
-    colors_secondary: Optional[List[str]] = None
+    colors: Optional[list[str]] = None
+    colors_secondary: Optional[list[str]] = None
     pattern: Optional[str] = None
     gender: Optional[str] = None
     cut: Optional[str] = None
     leg_cut:  Optional[str] = None
     rise:     Optional[str] = None
     length:   Optional[str] = None
-    style_tags: Optional[List[str]] = None
+    style_tags: Optional[list[str]] = None
     texture: Optional[str] = None
-    materials: Optional[List[str]] = None
-    design_details: Optional[List[str]] = None
+    materials: Optional[list[str]] = None
+    design_details: Optional[list[str]] = None
     neck_type: Optional[str] = None
     sleeve_type: Optional[str] = None
     hem_finish: Optional[str] = None
     description: Optional[str] = None
-    sizes: Optional[List[str]] = None
+    sizes: Optional[list[str]] = None
     available: bool = True
     ai_classified: bool = False
-    variants: List[VariantRead] = []
+    variants: list[VariantRead] = []
 
     model_config = {"from_attributes": True}
 
@@ -163,7 +165,7 @@ class SearchRequest(BaseModel):
 class SearchResponse(BaseModel):
     query: str
     total: int
-    results: List[ProductSummary]
+    results: list[ProductSummary]
 
 
 # ── Stats ────────────────────────────────────────────────────────────────────
@@ -186,4 +188,34 @@ class ScrapeResponse(BaseModel):
     new_products: int
     updated_products: int
     classified_products: int
-    errors: List[str] = []
+    errors: list[str] = []
+
+
+# ── Scrape logs ───────────────────────────────────────────────────────────────
+
+class ScrapeLogRead(BaseModel):
+    id: int
+    store_id: int
+    started_at: datetime
+    finished_at: Optional[datetime] = None
+    products_found: int = 0
+    products_new: int = 0
+    products_updated: int = 0
+    error_message: Optional[str] = None
+    success: bool = True
+
+    model_config = {"from_attributes": True}
+
+
+# ── Enrich status ─────────────────────────────────────────────────────────────
+
+class StoreEnrichStatus(BaseModel):
+    """Estado de enriquecimiento por tienda, incluyendo el último scrape log."""
+    store_id: int
+    store_name: str
+    total: int
+    enriched: int
+    classified: int
+    pending: int
+    percent: float
+    last_scrape: Optional[ScrapeLogRead] = None

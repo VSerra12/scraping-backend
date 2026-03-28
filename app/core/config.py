@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     SCRAPING_DELAY_MIN: float = 1.0
     SCRAPING_DELAY_MAX: float = 2.0
     MAX_PAGES_PER_STORE: int = 20
-    PRODUCTS_PER_PAGE: int = 50
+    PRODUCTS_PER_PAGE: int = 60
 
     # IA
     AI_MODEL: str = "claude-sonnet-4-20250514"

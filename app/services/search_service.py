@@ -82,7 +82,7 @@ def search_products(request: SearchRequest, db: Session) -> SearchResponse:
 
     # ── Ordenamiento y paginación ─────────────────────────────────────────────
     total = query.count()
-    query = query.order_by(Product.ai_classified.desc(), Product.price.asc().nulls_last())
+    query = query.order_by(func.random())
     products = query.offset(request.offset).limit(request.limit).all()
 
     # ── Serialización ─────────────────────────────────────────────────────────

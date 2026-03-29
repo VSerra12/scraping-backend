@@ -1,8 +1,18 @@
 """
-ai_routes.py – Endpoints para clasificación con IA (protegidos)
+ai_routes.py – Endpoints para clasificación con IA (protegidos).
+
+Política de errores:
+- Los errores internos se loguean completos con logger.error().
+- Al cliente solo llega un mensaje genérico + request_id para seguimiento.
+- Nunca se expone str(e), stack traces ni detalles de implementación.
+
+Rate limiting (por IP, via slowapi):
+- /ai/classify/{id}      → 20 req/min
+- /ai/classify-pending   → 5 req/min  (batch costoso)
 """
+import uuid
 import logging
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request
 from sqlalchemy.orm import Session
 from sqlalchemy import select
 
@@ -10,6 +20,7 @@ from app.core.database import get_db
 from app.models.models import Product
 from app.services.ai_classifier import classify_product
 from app.api.auth import require_admin
+from app.core.rate_limiter import limiter, LIMIT_AI_CLASSIFY, LIMIT_AI_BATCH
 
 logger = logging.getLogger(__name__)
 ai_router = APIRouter(prefix="/ai", tags=["IA"])
@@ -25,7 +36,9 @@ def estimate_cost(product_count: int) -> dict:
 
 
 @ai_router.post("/classify/{product_id}")
+@limiter.limit(LIMIT_AI_CLASSIFY)
 def classify_single_product(
+    request: Request,                          # requerido por slowapi
     product_id: int,
     db: Session = Depends(get_db),
     _: dict = Depends(require_admin),
@@ -33,6 +46,8 @@ def classify_single_product(
     product = db.get(Product, product_id)
     if not product:
         raise HTTPException(status_code=404, detail="Producto no encontrado")
+
+    request_id = str(uuid.uuid4())
     try:
         classification = classify_product(product.title, product.description or "")
         product.category      = classification["category"]
@@ -44,14 +59,26 @@ def classify_single_product(
         db.commit()
         db.refresh(product)
         return {"success": True, "product_id": product_id, "classification": classification}
+
     except Exception as e:
         db.rollback()
-        logger.error(f"Error clasificando producto {product_id}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(
+            "Error clasificando producto | request_id=%s | product_id=%d | %s",
+            request_id, product_id, e, exc_info=True,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "message": "Error interno al clasificar el producto.",
+                "request_id": request_id,
+            },
+        )
 
 
 @ai_router.post("/classify-pending")
+@limiter.limit(LIMIT_AI_BATCH)
 def classify_pending_products(
+    request: Request,                          # requerido por slowapi
     background_tasks: BackgroundTasks,
     limit: int = 50,
     db: Session = Depends(get_db),
@@ -94,10 +121,16 @@ def _run_classification_batch(products_data: list[dict], db: Session):
             success_count += 1
             time.sleep(0.3)
         except Exception as e:
-            logger.error(f"Error clasificando producto {item['id']}: {e}")
+            logger.error(
+                "Error clasificando producto en batch | product_id=%d | %s",
+                item["id"], e, exc_info=True,
+            )
             continue
     db.commit()
-    logger.info(f"Batch completado: {success_count}/{len(products_data)} productos clasificados")
+    logger.info(
+        "Batch completado: %d/%d productos clasificados",
+        success_count, len(products_data),
+    )
 
 
 @ai_router.get("/stats")

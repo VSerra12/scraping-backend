@@ -16,7 +16,7 @@ from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request
 from sqlalchemy.orm import Session
 from sqlalchemy import select
 
-from app.core.database import get_db
+from app.core.database import get_db, SessionLocal
 from app.models.models import Product
 from app.services.ai_classifier import classify_product
 from app.api.auth import require_admin
@@ -91,11 +91,16 @@ def classify_pending_products(
         return {"message": "No hay productos pendientes de clasificación", "count": 0}
 
     products_data = [
-        {"id": p.id, "title": p.title, "description": p.description or ""}
+        {
+            "id": p.id,
+            "title": p.title,
+            "description": p.description or "",
+            "image_url": p.image_url,       # ← agregado
+        }
         for p in pending
     ]
     cost = estimate_cost(len(products_data))
-    background_tasks.add_task(_run_classification_batch, products_data, db)
+    background_tasks.add_task(_run_classification_batch, products_data)  # sin db
     return {
         "message": "Clasificación iniciada en background",
         "products_to_classify": len(products_data),
@@ -103,34 +108,46 @@ def classify_pending_products(
     }
 
 
-def _run_classification_batch(products_data: list[dict], db: Session):
+def _run_classification_batch(products_data: list[dict]):  # ← sin db en parámetro
     import time
+    db = SessionLocal()  # sesión propia, independiente del request
     success_count = 0
-    for item in products_data:
-        try:
-            classification = classify_product(item["title"], item["description"])
-            product = db.get(Product, item["id"])
-            if not product:
+    try:
+        for item in products_data:
+            try:
+                classification = classify_product(
+                    item["title"],
+                    item["description"],
+                    image_url=item.get("image_url"),   # ← agregado
+                )
+                product = db.get(Product, item["id"])
+                if not product:
+                    continue
+                product.category      = classification["category"]
+                product.subcategory   = classification["subcategory"]
+                product.colors        = classification["colors"]
+                product.style_tags    = classification["style_tags"]
+                product.gender        = classification["gender"]
+                product.ai_classified = True
+                success_count += 1
+                time.sleep(0.3)
+            except Exception as e:
+                logger.error(
+                    "Error clasificando producto en batch | product_id=%d | %s",
+                    item["id"], e, exc_info=True,
+                )
+                db.rollback()  # limpia estado sucio para que el siguiente producto pueda continuar
                 continue
-            product.category      = classification["category"]
-            product.subcategory   = classification["subcategory"]
-            product.colors        = classification["colors"]
-            product.style_tags    = classification["style_tags"]
-            product.gender        = classification["gender"]
-            product.ai_classified = True
-            success_count += 1
-            time.sleep(0.3)
-        except Exception as e:
-            logger.error(
-                "Error clasificando producto en batch | product_id=%d | %s",
-                item["id"], e, exc_info=True,
-            )
-            continue
-    db.commit()
-    logger.info(
-        "Batch completado: %d/%d productos clasificados",
-        success_count, len(products_data),
-    )
+        db.commit()
+        logger.info(
+            "Batch completado: %d/%d productos clasificados",
+            success_count, len(products_data),
+        )
+    except Exception as e:
+        db.rollback()
+        logger.error("Error fatal en batch | %s", e, exc_info=True)
+    finally:
+        db.close()  # siempre se libera la conexión
 
 
 @ai_router.get("/stats")

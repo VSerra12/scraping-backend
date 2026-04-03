@@ -1,6 +1,10 @@
 """
 Servicio de clasificación de productos usando Claude API.
 Solo clasifica productos nuevos — los existentes NO se re-procesan.
+
+Optimizaciones aplicadas:
+- Prompt caching en CLASSIFICATION_SYSTEM (hasta 90% ahorro en tokens de system prompt)
+- Log de uso de tokens para monitorear cache hits
 """
 import json
 import logging
@@ -15,9 +19,12 @@ logger = logging.getLogger(__name__)
 client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  System prompt (separado del user message para mejor control)
+#  System prompt cacheado — se procesa una vez cada 5 min, no en cada llamada
 # ─────────────────────────────────────────────────────────────────────────────
-CLASSIFICATION_SYSTEM = """
+CLASSIFICATION_SYSTEM = [
+    {
+        "type": "text",
+        "text": """
 Sos un experto en moda argentina. Tu única tarea es clasificar prendas de ropa.
 Estos son SIEMPRE productos de vestimenta de tiendas argentinas.
 
@@ -125,7 +132,10 @@ Título: "OSLO" / Desc: "Remera básica de jersey 100% algodón cuello redondo o
 
 Título: "FALDA PLISADA MIDI"
 → category: falda, leg_cut: a_line, length: midi, pattern: liso
-"""
+""",
+        "cache_control": {"type": "ephemeral"},  # ← cachea este bloque por 5 min
+    }
+]
 
 USER_TEMPLATE = """Título: {title}
 Tienda: {store_context}
@@ -186,6 +196,20 @@ def classify_product(
     return result
 
 
+def _log_token_usage(usage, method: str):
+    """Loguea uso de tokens para monitorear cache hits en desarrollo."""
+    cache_write = getattr(usage, "cache_creation_input_tokens", 0) or 0
+    cache_read  = getattr(usage, "cache_read_input_tokens", 0) or 0
+    logger.debug(
+        "Tokens [%s] | input=%d cache_write=%d cache_read=%d output=%d",
+        method,
+        usage.input_tokens,
+        cache_write,
+        cache_read,
+        usage.output_tokens,
+    )
+
+
 def _classify_with_image(prompt: str, image_url: str) -> Optional[dict]:
     """Clasifica usando la imagen del producto."""
     try:
@@ -196,7 +220,7 @@ def _classify_with_image(prompt: str, image_url: str) -> Optional[dict]:
         message = client.messages.create(
             model=settings.AI_MODEL,
             max_tokens=settings.AI_MAX_TOKENS,
-            system=CLASSIFICATION_SYSTEM,
+            system=CLASSIFICATION_SYSTEM,  # ← lista con cache_control
             messages=[{
                 "role": "user",
                 "content": [
@@ -212,6 +236,7 @@ def _classify_with_image(prompt: str, image_url: str) -> Optional[dict]:
                 ],
             }]
         )
+        _log_token_usage(message.usage, "image")
         return _parse_response(message.content[0].text)
 
     except Exception as e:
@@ -225,9 +250,10 @@ def _classify_text_only(prompt: str) -> dict:
         message = client.messages.create(
             model=settings.AI_MODEL,
             max_tokens=settings.AI_MAX_TOKENS,
-            system=CLASSIFICATION_SYSTEM,
+            system=CLASSIFICATION_SYSTEM,  # ← lista con cache_control
             messages=[{"role": "user", "content": prompt}]
         )
+        _log_token_usage(message.usage, "text")
         return _parse_response(message.content[0].text)
 
     except anthropic.APIError as e:
@@ -325,7 +351,7 @@ def _parse_response(raw: str) -> dict:
         "condition":        clean_str(data.get("condition"), "new"),
 
         # Silueta y corte
-        "cut":              clean_str(data.get("fit") or data.get("cut")),  # "fit" es el nombre nuevo
+        "cut":              clean_str(data.get("fit") or data.get("cut")),
         "leg_cut":          clean_str(data.get("leg_cut")),
         "rise":             clean_str(data.get("rise")),
         "length":           clean_str(data.get("length")),

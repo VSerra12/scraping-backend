@@ -1,5 +1,6 @@
 import logging
 from contextlib import asynccontextmanager
+from app.core.config import settings
 from fastapi import FastAPI, HTTPException
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -74,12 +75,7 @@ app.add_exception_handler(Exception, unhandled_exception_handler)
 # CORS — ajustar orígenes en producción, nunca usar allow_origins=["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://localhost:5173",  # Vite dev server
-        "http://127.0.0.1:3000",
-        "http://127.0.0.1:5173",
-    ],
+    allow_origins=settings.ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

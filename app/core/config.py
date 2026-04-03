@@ -24,6 +24,15 @@ class Settings(BaseSettings):
     # Scheduler
     SCRAPE_INTERVAL_HOURS: int = 24
 
+    # CORS — en producción sobreescribir en .env con:
+    # ALLOWED_ORIGINS=["https://tu-dominio.com"]
+    ALLOWED_ORIGINS: list[str] = [
+        "http://localhost:5173",
+        "http://localhost:3000",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:3000",
+    ]
+
     # Auth admin
     ADMIN_USERNAME: str = "administrador"
     ADMIN_PASSWORD: str = "tu_password_seguro"

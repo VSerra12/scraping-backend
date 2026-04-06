@@ -17,6 +17,9 @@ from app.core.exception_handlers import (
     unhandled_exception_handler,
 )
 from app.api.routes import router
+from app.core.config import settings as _settings
+
+_UNSAFE_KEY = "dev-secret-key-change-in-production"
 
 # Configurar logging
 logging.basicConfig(
@@ -36,6 +39,12 @@ async def lifespan(app: FastAPI):
     """Inicialización y limpieza al arrancar/apagar la app."""
     logger.info("🚀 Iniciando Fashion Search API...")
     create_tables()
+    if _settings.SECRET_KEY == _UNSAFE_KEY and _settings.ENV != "development":
+        raise RuntimeError(
+            "SECRET_KEY insegura detectada en entorno de producción. "
+            "Generá una clave con: python -c \"import secrets; print(secrets.token_hex(32))\" "
+            "y configurala en tu .env"
+        )
     logger.info("✅ Base de datos lista")
     setup_scheduler()
 

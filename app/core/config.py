@@ -33,6 +33,8 @@ class Settings(BaseSettings):
         "http://127.0.0.1:3000",
     ]
 
+    ENV: str = "production"  # "development" | "production"
+
     # Auth admin
     ADMIN_USERNAME: str = "administrador"
     ADMIN_PASSWORD: str = "tu_password_seguro"

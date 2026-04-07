@@ -82,12 +82,12 @@ class Product(Base):
     variants = relationship("ProductVariant", back_populates="product", cascade="all, delete-orphan")
 
     __table_args__ = (
-        UniqueConstraint("store_id", "external_id", name="products_store_id_external_id_key"),
-        Index("ix_products_category_gender", "category", "gender"),
-        Index("idx_products_store",  "store_id"),                              # nombre real en DB
-        Index("ix_products_enriched", "enriched", "ai_classified"),
-        Index("ix_products_cut",     "cut"),
-        Index("ix_products_pattern", "pattern"),
+    UniqueConstraint("store_id", "external_id", name="products_store_id_external_id_key"),
+        Index("ix_products_category_gender", "category", "gender", postgresql_if_not_exists=True),
+        Index("idx_products_store", "store_id", postgresql_if_not_exists=True),
+        Index("ix_products_enriched", "enriched", "ai_classified", postgresql_if_not_exists=True),
+        Index("ix_products_cut", "cut", postgresql_if_not_exists=True),
+        Index("ix_products_pattern", "pattern", postgresql_if_not_exists=True),
     )
 
     def __repr__(self):
@@ -143,9 +143,9 @@ class ScrapeLog(Base):
     store = relationship("Store", back_populates="scrape_logs")
 
     __table_args__ = (
-        Index("ix_scrape_logs_store_id",   "store_id"),
-        Index("ix_scrape_logs_started_at", "started_at"),
-        Index("ix_scrape_logs_success",    "success"),
+        Index("ix_scrape_logs_store_id", "store_id", postgresql_if_not_exists=True),
+        Index("ix_scrape_logs_started_at", "started_at", postgresql_if_not_exists=True),
+        Index("ix_scrape_logs_success", "success", postgresql_if_not_exists=True),
     )
 
     def __repr__(self):

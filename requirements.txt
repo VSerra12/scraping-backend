@@ -12,4 +12,4 @@ fake-useragent==1.5.1
 tenacity==8.3.0
 slowapi==0.1.9
 psycopg2-binary==2.9.10
-bcrypt==3.2.4
+bcrypt==4.2.1

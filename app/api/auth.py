@@ -119,28 +119,16 @@ def login(body: LoginRequest):
         raise HTTPException(status_code=401, detail="Credenciales incorrectas")
 
     token = create_token(body.username)
-
-    # secure=True solo en producción (requiere HTTPS)
-    is_production = getattr(settings, "ENVIRONMENT", "development") == "production"
-
-    response.set_cookie(
-        key=COOKIE_NAME,
-        value=token,
-        httponly=True,           # JavaScript no puede leerla
-        samesite="lax",          # protege contra CSRF en navegación normal
-        secure=is_production,    # True en prod → solo HTTPS
-        max_age=TOKEN_TTL_SECONDS,
-        path="/",
-    )
-
     logger.info(f"Login exitoso: {body.username}")
     return {"token": token, "expires_in": TOKEN_TTL_SECONDS}
 
 
 @auth_router.post("/logout")
-def logout(response: Response):
-    """Borra la cookie del admin."""
-    response.delete_cookie(key=COOKIE_NAME, path="/")
+def logout():
+    """
+    El cliente descarta el token de memoria. No hay estado en el servidor.
+    Este endpoint existe para mantener la interfaz consistente.
+    """
     return {"message": "Sesión cerrada"}
 
 

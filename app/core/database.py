@@ -22,4 +22,4 @@ def get_db():
 
 def create_tables():
     from app.models.models import Store, Product, SearchLog  # noqa: F401
-    Base.metadata.create_all(bind=engine)
+    Base.metadata.create_all(bind=engine, checkfirst=True)

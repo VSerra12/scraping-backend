@@ -1,15 +1,16 @@
 """
-auth.py — Autenticación con JWT en header Authorization.
+auth.py — Autenticación con JWT en httpOnly cookie.
 
 Flujo:
-  POST /api/auth/login   →  { "token": "<jwt>", "expires_in": 7200 }
-  POST /api/auth/logout  →  { "message": "Sesión cerrada" }  (el cliente descarta el token)
-  GET  /api/auth/me      →  verifica el header Authorization: Bearer <token>
+  POST /api/auth/login   →  Set-Cookie: token=<jwt>; HttpOnly; SameSite=Lax
+  POST /api/auth/logout  →  borra la cookie
+  GET  /api/auth/me      →  verifica que la cookie siga siendo válida
 
 Configurar en .env:
   ADMIN_USERNAME=admin
   ADMIN_PASSWORD=$2b$12$...   ← hash bcrypt
   SECRET_KEY=una_clave_secreta_larga
+  ENVIRONMENT=production      ← activa Secure en la cookie
 
 Generar hash de contraseña:
   python -c "import bcrypt; print(bcrypt.hashpw(b'tu_password', bcrypt.gensalt()).decode())"
@@ -21,7 +22,7 @@ import time
 import base64
 import logging
 import bcrypt
-from fastapi import APIRouter, HTTPException, Depends, Request
+from fastapi import APIRouter, HTTPException, Depends, Request, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from app.core.config import settings
@@ -31,6 +32,7 @@ auth_router = APIRouter(prefix="/auth", tags=["Auth"])
 bearer_scheme = HTTPBearer(auto_error=False)
 
 TOKEN_TTL_SECONDS = 60 * 60 * 2  # 2 horas
+COOKIE_NAME = "admin_token"
 
 
 # ── JWT manual (HS256) ────────────────────────────────────────────────────────
@@ -78,15 +80,16 @@ def verify_token(token: str) -> dict:
 
 # ── Dependencia FastAPI ───────────────────────────────────────────────────────
 
-def require_admin(credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme)):
+def require_admin(request: Request):
     """
-    Lee el JWT desde el header Authorization: Bearer <token>.
+    Lee el JWT desde la httpOnly cookie.
     Uso: def my_endpoint(..., _: dict = Depends(require_admin))
     """
-    if not credentials:
+    token = request.cookies.get(COOKIE_NAME)
+    if not token:
         raise HTTPException(status_code=401, detail="Token requerido")
     try:
-        return verify_token(credentials.credentials)
+        return verify_token(token)
     except ValueError as e:
         raise HTTPException(status_code=401, detail=str(e))
 
@@ -98,11 +101,9 @@ class LoginRequest(BaseModel):
     password: str
 
 @auth_router.post("/login")
-def login(body: LoginRequest):
+def login(body: LoginRequest, response: Response):
     """
-    Valida credenciales y devuelve el JWT en el body.
-    El cliente debe guardarlo en memoria e incluirlo en cada request
-    como: Authorization: Bearer <token>
+    Valida credenciales y setea un httpOnly cookie con el JWT.
     ADMIN_PASSWORD debe ser un hash bcrypt.
     """
     username_ok = body.username == settings.ADMIN_USERNAME
@@ -119,20 +120,32 @@ def login(body: LoginRequest):
         raise HTTPException(status_code=401, detail="Credenciales incorrectas")
 
     token = create_token(body.username)
+
+    # secure=True solo en producción (requiere HTTPS)
+    is_production = getattr(settings, "ENVIRONMENT", "development") == "production"
+
+    response.set_cookie(
+        key=COOKIE_NAME,
+        value=token,
+        httponly=True,           # JavaScript no puede leerla
+        samesite="lax",          # protege contra CSRF en navegación normal
+        secure=is_production,    # True en prod → solo HTTPS
+        max_age=TOKEN_TTL_SECONDS,
+        path="/",
+    )
+
     logger.info(f"Login exitoso: {body.username}")
-    return {"token": token, "expires_in": TOKEN_TTL_SECONDS}
+    return {"message": "Login exitoso", "expires_in": TOKEN_TTL_SECONDS}
 
 
 @auth_router.post("/logout")
-def logout():
-    """
-    El cliente descarta el token de memoria. No hay estado en el servidor.
-    Este endpoint existe para mantener la interfaz consistente.
-    """
+def logout(response: Response):
+    """Borra la cookie del admin."""
+    response.delete_cookie(key=COOKIE_NAME, path="/")
     return {"message": "Sesión cerrada"}
 
 
 @auth_router.get("/me")
 def me(payload: dict = Depends(require_admin)):
-    """Verifica que el token siga siendo válido. Útil para el front al recargar."""
+    """Verifica que la cookie siga siendo válida. Útil para el front al recargar."""
     return {"username": payload["sub"], "exp": payload["exp"]}

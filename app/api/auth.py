@@ -128,8 +128,8 @@ def login(body: LoginRequest, response: Response):
         key=COOKIE_NAME,
         value=token,
         httponly=True,           # JavaScript no puede leerla
-        samesite="lax",          # protege contra CSRF en navegación normal
-        secure=is_production,    # True en prod → solo HTTPS
+        samesite="none",# protege contra CSRF en navegación normal
+        secure=True,    # True en prod → solo HTTPS
         max_age=TOKEN_TTL_SECONDS,
         path="/",
     )
@@ -141,7 +141,7 @@ def login(body: LoginRequest, response: Response):
 @auth_router.post("/logout")
 def logout(response: Response):
     """Borra la cookie del admin."""
-    response.delete_cookie(key=COOKIE_NAME, path="/")
+    response.delete_cookie(key=COOKIE_NAME, path="/", samesite="none", secure=True)
     return {"message": "Sesión cerrada"}
 
 

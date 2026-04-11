@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from app.core.database import get_db
@@ -13,17 +13,22 @@ from app.models.schemas import (
 )
 from app.services.scraping_service import scrape_and_save
 from app.services.search_service import search_products
-from app.services.enrichment_service import (
-    run_enrichment_job,
-    get_enrichment_status,
-    reset_enrichment,
-)
+from app.services.enrichment_service import run_enrichment_job, get_enrichment_status
 from app.api.ai_routes import ai_router
 from app.api.auth import auth_router, require_admin
+from app.core.rate_limiter import limiter, LIMIT_ENRICH, LIMIT_SCRAPE, LIMIT_SCRAPE_ALL
 
 router = APIRouter()
 router.include_router(auth_router)
 router.include_router(ai_router)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Mapa de protección de endpoints
+# 🔓 Público:    GET /stores, GET /stores/{id}, POST /search, GET /stats,
+#                GET /enrich/status, GET /scrape-logs/{store_id}, GET /ai/stats
+# 🔒 require_admin: todo lo que escribe, scrapea o clasifica
+# 🚦 rate_limited: endpoints que llaman a IA o generan carga de red/CPU
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 # ─── Stores ────────────────────────────────────────────────────────────────────
@@ -32,7 +37,7 @@ router.include_router(ai_router)
 def create_store(
     store_data: StoreCreate,
     db: Session = Depends(get_db),
-    _: dict = Depends(require_admin),
+    _: dict = Depends(require_admin),          # 🔒
 ):
     existing = db.query(Store).filter(Store.url == store_data.url).first()
     if existing:
@@ -45,7 +50,7 @@ def create_store(
 
 
 @router.get("/stores", response_model=list[StoreRead], tags=["Tiendas"])
-def list_stores(location: str = None, db: Session = Depends(get_db)):
+def list_stores(location: str = None, db: Session = Depends(get_db)):   # 🔓
     query = db.query(Store)
     if location:
         term = f"%{location.lower()}%"
@@ -57,7 +62,7 @@ def list_stores(location: str = None, db: Session = Depends(get_db)):
 
 
 @router.get("/stores/{store_id}", response_model=StoreRead, tags=["Tiendas"])
-def get_store(store_id: int, db: Session = Depends(get_db)):
+def get_store(store_id: int, db: Session = Depends(get_db)):             # 🔓
     store = db.query(Store).filter(Store.id == store_id).first()
     if not store:
         raise HTTPException(status_code=404, detail="Tienda no encontrada")
@@ -68,7 +73,7 @@ def get_store(store_id: int, db: Session = Depends(get_db)):
 def delete_store(
     store_id: int,
     db: Session = Depends(get_db),
-    _: dict = Depends(require_admin),
+    _: dict = Depends(require_admin),          # 🔒
 ):
     store = db.query(Store).filter(Store.id == store_id).first()
     if not store:
@@ -81,7 +86,7 @@ def delete_store(
 def toggle_store_active(
     store_id: int,
     db: Session = Depends(get_db),
-    _: dict = Depends(require_admin),
+    _: dict = Depends(require_admin),          # 🔒
 ):
     store = db.query(Store).filter(Store.id == store_id).first()
     if not store:
@@ -95,10 +100,12 @@ def toggle_store_active(
 # ─── Scraping ──────────────────────────────────────────────────────────────────
 
 @router.post("/scrape/{store_id}", response_model=ScrapeResponse, tags=["Scraping"])
+@limiter.limit(LIMIT_SCRAPE)                                             # 🚦 10/min
 def scrape_store(
+    request: Request,                          # requerido por slowapi
     store_id: int,
     db: Session = Depends(get_db),
-    _: dict = Depends(require_admin),
+    _: dict = Depends(require_admin),          # 🔒
 ):
     store = db.query(Store).filter(Store.id == store_id).first()
     if not store:
@@ -109,9 +116,11 @@ def scrape_store(
 
 
 @router.post("/scrape-all", response_model=list[ScrapeResponse], tags=["Scraping"])
+@limiter.limit(LIMIT_SCRAPE_ALL)                                         # 🚦 5/min
 def scrape_all_stores(
+    request: Request,                          # requerido por slowapi
     db: Session = Depends(get_db),
-    _: dict = Depends(require_admin),
+    _: dict = Depends(require_admin),          # 🔒
 ):
     stores = db.query(Store).filter(Store.active == True).all()  # noqa: E712
     if not stores:
@@ -123,7 +132,7 @@ def scrape_all_stores(
 def get_scrape_logs(
     store_id: int,
     limit: int = Query(default=10, ge=1, le=100),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db),             # 🔓 — solo lectura, sin datos sensibles
 ):
     store = db.query(Store).filter(Store.id == store_id).first()
     if not store:
@@ -140,44 +149,18 @@ def get_scrape_logs(
 
 # ─── Enriquecimiento ───────────────────────────────────────────────────────────
 
-@router.post("/enrich/reset", tags=["Scraping"])
-def reset_enrichment_flags(
-    store_id: int = None,
-    db: Session = Depends(get_db),
-    _: dict = Depends(require_admin),
-):
-    """
-    Resetea los flags enriched y ai_classified en todos los productos
-    (o solo en una tienda si se pasa store_id).
-    Después de esto, el próximo /enrich re-clasificará todo desde cero.
-    """
-    result = reset_enrichment(db, store_id=store_id)
-    return {
-        "message": f"Reset completo — {result['reset_count']} productos marcados para re-clasificación",
-        "reset_count": result["reset_count"],
-        "store_id": store_id,
-    }
-
-
 @router.post("/enrich", tags=["Scraping"])
+@limiter.limit(LIMIT_ENRICH)                                             # 🚦 10/min
 def enrich_products(
+    request: Request,                          # requerido por slowapi
     batch_size: int = 20,
     store_id: int = None,
-    force: bool = False,
     db: Session = Depends(get_db),
-    _: dict = Depends(require_admin),
+    _: dict = Depends(require_admin),          # 🔒
 ):
-    """
-    Enriquece/clasifica productos pendientes.
-
-    - batch_size: cuántos productos procesar (default 20, máx 100)
-    - store_id: opcional, solo esa tienda
-    - force: si True, re-clasifica productos ya enriquecidos (reutiliza
-             descripción existente, no re-visita la página)
-    """
     if batch_size < 1 or batch_size > 100:
         raise HTTPException(status_code=400, detail="batch_size debe estar entre 1 y 100")
-    result = run_enrichment_job(db, batch_size=batch_size, store_id=store_id, force=force)
+    result = run_enrichment_job(db, batch_size=batch_size, store_id=store_id)
     status = get_enrichment_status(db)
     return {
         "message": "Enriquecimiento completo",
@@ -188,9 +171,9 @@ def enrich_products(
 
 
 @router.get("/enrich/status", tags=["Scraping"])
-def enrichment_status(db: Session = Depends(get_db)):
+def enrichment_status(db: Session = Depends(get_db)):                   # 🔓
     """
-    Público — muestra estado del enriquecimiento con detalle por tienda.
+    Público — el front lo usa para mostrar progreso de enriquecimiento.
     Incluye el último scrape log de cada tienda.
     """
     global_status = get_enrichment_status(db)
@@ -236,17 +219,18 @@ def enrichment_status(db: Session = Depends(get_db)):
 
 
 @router.post("/enrich/{store_id}", tags=["Scraping"])
+@limiter.limit(LIMIT_ENRICH)                                             # 🚦 10/min
 def enrich_store(
+    request: Request,                          # requerido por slowapi
     store_id: int,
     batch_size: int = 20,
-    force: bool = False,
     db: Session = Depends(get_db),
-    _: dict = Depends(require_admin),
+    _: dict = Depends(require_admin),          # 🔒
 ):
     store = db.query(Store).filter(Store.id == store_id).first()
     if not store:
         raise HTTPException(status_code=404, detail="Tienda no encontrada")
-    result = run_enrichment_job(db, batch_size=batch_size, store_id=store_id, force=force)
+    result = run_enrichment_job(db, batch_size=batch_size, store_id=store_id)
     status = get_enrichment_status(db)
     return {
         "message": f"Enriquecimiento de {store.name} completo",
@@ -259,14 +243,14 @@ def enrich_store(
 # ─── Búsqueda ──────────────────────────────────────────────────────────────────
 
 @router.post("/search", response_model=SearchResponse, tags=["Búsqueda"])
-def search(request: SearchRequest, db: Session = Depends(get_db)):
+def search(request: SearchRequest, db: Session = Depends(get_db)):       # 🔓
     return search_products(request, db)
 
 
 # ─── Estadísticas ──────────────────────────────────────────────────────────────
 
 @router.get("/stats", response_model=StatsResponse, tags=["Estadísticas"])
-def get_stats(db: Session = Depends(get_db)):
+def get_stats(db: Session = Depends(get_db)):                            # 🔓
     total_stores        = db.query(Store).count()
     active_stores       = db.query(Store).filter(Store.active == True).count()         # noqa: E712
     total_products      = db.query(Product).count()

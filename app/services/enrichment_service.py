@@ -2,7 +2,7 @@
 Servicio de enriquecimiento de productos.
 
 Flujo:
-1. Busca productos con enriched=False (o todos si force=True)
+1. Busca productos con enriched=False en la DB
 2. Visita la página individual de cada producto
 3. Extrae descripción completa, materiales y talles
 4. Clasifica con IA usando toda la info disponible
@@ -185,7 +185,7 @@ class ProductEnricher(BaseScraper):
             "tela:", "tejido:", "composición:", "composicion:", "material:",
             "confeccionado en", "100%", "polyester", "algodón", "cotton",
             "morley", "jersey", "lycra", "spandex", "lino", "seda",
-            "lanilla", "gabardina", "denim", "microfibra", "modal", "viscosa",
+            "lanilla", "gabardina", "denim", "microfibra", "modal",
         ]
         if description:
             for kw in fabric_keywords:
@@ -196,39 +196,25 @@ class ProductEnricher(BaseScraper):
         return None
 
 
-def run_enrichment_job(
-    db: Session,
-    batch_size: int = 20,
-    store_id: int = None,
-    force: bool = False,
-) -> dict:
+def run_enrichment_job(db: Session, batch_size: int = 20, store_id: int = None) -> dict:
     """
-    Job de enriquecimiento.
+    Job de enriquecimiento asíncrono.
     Procesa hasta batch_size productos pendientes por vez.
-
-    Args:
-        db: sesión de base de datos
-        batch_size: máximo de productos a procesar
-        store_id: opcional, filtra por tienda específica
-        force: si True, re-clasifica productos ya enriquecidos (ignora enriched=True)
+    store_id: opcional, filtra por tienda específica.
     """
-    query = db.query(Product).filter(Product.available == True)  # noqa: E712
-
-    if not force:
-        query = query.filter(Product.enriched == False)  # noqa: E712
-
+    query = db.query(Product).filter(
+        Product.enriched == False,  # noqa: E712
+        Product.available == True,  # noqa: E712
+    )
     if store_id:
         query = query.filter(Product.store_id == store_id)
-
     pending = query.limit(batch_size).all()
 
     if not pending:
-        mode = "forzado" if force else "normal"
-        logger.info(f"Enriquecimiento ({mode}): no hay productos pendientes.")
+        logger.info("Enriquecimiento: no hay productos pendientes.")
         return {"enriched": 0, "failed": 0}
 
-    mode_label = "re-clasificación forzada" if force else "enriquecimiento"
-    logger.info(f"{mode_label}: procesando {len(pending)} productos...")
+    logger.info(f"Enriquecimiento: procesando {len(pending)} productos...")
 
     enricher = ProductEnricher()
     enriched_count = 0
@@ -243,21 +229,11 @@ def run_enrichment_job(
             continue
 
         try:
-            # En modo force, si ya tiene descripción guardada la reutilizamos
-            # y solo re-visitamos la página si no tiene descripción
-            if force and product.description:
-                enriched_data = {
-                    "description": product.description,
-                    "materials_raw": product.materials_raw,
-                    "sizes": product.sizes or [],
-                    "colors_hint": [],
-                }
-            else:
-                enriched_data = enricher.enrich_product(product, store)
+            enriched_data = enricher.enrich_product(product, store)
 
             if enriched_data.get("description"):
                 product.description = enriched_data["description"]
-            if enriched_data.get("materials_raw"):
+            if enriched_data.get("materials_raw"):          # ← era "materials"
                 product.materials_raw = enriched_data["materials_raw"]
             if enriched_data.get("sizes"):
                 product.sizes = enriched_data["sizes"]
@@ -272,38 +248,45 @@ def run_enrichment_job(
                 colors_hint=colors_hint,
             )
 
+            # Campos base
             product.category         = classification["category"]
             product.subcategory      = classification["subcategory"]
             product.colors           = classification["colors"]
             product.style_tags       = classification["style_tags"]
             product.gender           = classification["gender"]
             product.condition        = classification.get("condition", "new")
+
+            # Silueta y corte
             product.cut              = classification.get("cut")
             product.leg_cut          = classification.get("leg_cut")
             product.rise             = classification.get("rise")
             product.length           = classification.get("length")
+
+            # Materiales y textura
             product.materials        = classification.get("materials", [])
             product.texture          = classification.get("texture")
             product.thickness        = classification.get("thickness")
             product.stretch          = classification.get("stretch")
+
+            # Color y patrón
             product.colors_secondary = classification.get("colors_secondary", [])
             product.pattern          = classification.get("pattern")
+
+            # Detalles constructivos
             product.design_details   = classification.get("design_details", [])
             product.neck_type        = classification.get("neck_type")
             product.sleeve_type      = classification.get("sleeve_type")
             product.hem_finish       = classification.get("hem_finish")
-            product.ai_classified    = True
-            product.enriched         = True
+
+            product.ai_classified = True
+            product.enriched      = True
 
             db.flush()
             enriched_count += 1
-            logger.info(
-                f"  ✓ {product.title[:40]} → {product.category} / "
-                f"{product.cut} / {product.colors}"
-            )
+            logger.info(f"  ✓ {product.title[:40]} → {product.category} / {product.cut} / {product.colors}")
 
         except Exception as e:
-            logger.error(f"  ✗ Error en '{product.title[:40]}': {e}")
+            logger.error(f"  ✗ Error enriqueciendo '{product.title[:40]}': {e}")
             product.enriched = True
             failed_count += 1
             try:
@@ -317,29 +300,6 @@ def run_enrichment_job(
     db.commit()
     logger.info(f"Enriquecimiento completo: {enriched_count} OK, {failed_count} fallidos")
     return {"enriched": enriched_count, "failed": failed_count}
-
-
-def reset_enrichment(db: Session, store_id: int = None) -> dict:
-    """
-    Resetea los flags enriched y ai_classified para forzar re-clasificación.
-    Si store_id se provee, solo resetea esa tienda.
-    Retorna la cantidad de productos reseteados.
-    """
-    query = db.query(Product)
-    if store_id:
-        query = query.filter(Product.store_id == store_id)
-
-    count = query.count()
-
-    query.update(
-        {Product.enriched: False, Product.ai_classified: False},
-        synchronize_session=False,
-    )
-    db.commit()
-
-    scope = f"tienda {store_id}" if store_id else "todos los productos"
-    logger.info(f"Reset de enriquecimiento: {count} productos en {scope}")
-    return {"reset_count": count}
 
 
 def get_enrichment_status(db: Session) -> dict:

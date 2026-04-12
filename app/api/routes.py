@@ -150,24 +150,33 @@ def get_scrape_logs(
 # ─── Enriquecimiento ───────────────────────────────────────────────────────────
 
 @router.post("/enrich", tags=["Scraping"])
-@limiter.limit(LIMIT_ENRICH)                                             # 🚦 10/min
 def enrich_products(
-    request: Request,                          # requerido por slowapi
     batch_size: int = 20,
     store_id: int = None,
+    force: bool = False,
     db: Session = Depends(get_db),
-    _: dict = Depends(require_admin),          # 🔒
+    _: dict = Depends(require_admin),
 ):
+    """
+    Enriquece productos pendientes.
+ 
+    - batch_size: cuántos procesar en esta llamada (1-100)
+    - store_id: opcional, limitar a una tienda
+    - force: si True, re-enriquece productos ya clasificados
+             (prioriza los con category='otro')
+    """
     if batch_size < 1 or batch_size > 100:
         raise HTTPException(status_code=400, detail="batch_size debe estar entre 1 y 100")
-    result = run_enrichment_job(db, batch_size=batch_size, store_id=store_id)
+    result = run_enrichment_job(db, batch_size=batch_size, store_id=store_id, force=force)
     status = get_enrichment_status(db)
     return {
         "message": "Enriquecimiento completo",
         "enriched_this_run": result["enriched"],
         "failed_this_run": result["failed"],
+        "force": force,
         "status": status,
     }
+ 
 
 
 @router.get("/enrich/status", tags=["Scraping"])
@@ -219,27 +228,127 @@ def enrichment_status(db: Session = Depends(get_db)):                   # 🔓
 
 
 @router.post("/enrich/{store_id}", tags=["Scraping"])
-@limiter.limit(LIMIT_ENRICH)                                             # 🚦 10/min
 def enrich_store(
-    request: Request,                          # requerido por slowapi
     store_id: int,
     batch_size: int = 20,
+    force: bool = False,
     db: Session = Depends(get_db),
-    _: dict = Depends(require_admin),          # 🔒
+    _: dict = Depends(require_admin),
 ):
+    """
+    Enriquece productos de una tienda específica.
+ 
+    - force: si True, re-clasifica productos ya enriquecidos de esa tienda
+    """
     store = db.query(Store).filter(Store.id == store_id).first()
     if not store:
         raise HTTPException(status_code=404, detail="Tienda no encontrada")
-    result = run_enrichment_job(db, batch_size=batch_size, store_id=store_id)
+    result = run_enrichment_job(db, batch_size=batch_size, store_id=store_id, force=force)
     status = get_enrichment_status(db)
     return {
         "message": f"Enriquecimiento de {store.name} completo",
         "enriched_this_run": result["enriched"],
         "failed_this_run": result["failed"],
+        "force": force,
         "status": status,
     }
 
-
+@router.post("/enrich/product/{product_id}", tags=["Scraping"])
+def enrich_single_product(
+    product_id: int,
+    db: Session = Depends(get_db),
+    _: dict = Depends(require_admin),
+):
+    """
+    Re-clasifica un producto individual visitando su página y llamando a la IA.
+    Útil para testing y corrección manual de clasificaciones incorrectas.
+    Devuelve los campos de clasificación actualizados.
+    """
+    from app.services.enrichment_service import ProductEnricher, _build_full_description
+    from app.services.ai_classifier import classify_product
+ 
+    product = db.query(Product).filter(Product.id == product_id).first()
+    if not product:
+        raise HTTPException(status_code=404, detail="Producto no encontrado")
+ 
+    store = db.query(Store).filter(Store.id == product.store_id).first()
+    if not store:
+        raise HTTPException(status_code=404, detail="Tienda no encontrada")
+ 
+    # Resetear flags
+    product.enriched = False
+    product.ai_classified = False
+    db.flush()
+ 
+    # Visitar página y extraer datos
+    enricher = ProductEnricher()
+    enriched_data = enricher.enrich_product(product, store)
+ 
+    # Actualizar campos de página
+    page_description = enriched_data.get("description")
+    if page_description:
+        if not product.description or len(page_description) > len(product.description or ""):
+            product.description = page_description
+ 
+    if enriched_data.get("materials_raw"):
+        product.materials_raw = enriched_data["materials_raw"]
+ 
+    if enriched_data.get("sizes"):
+        product.sizes = enriched_data["sizes"]
+ 
+    colors_hint = enriched_data.get("colors_hint") or []
+ 
+    # Clasificar con IA
+    full_description = _build_full_description(product, enriched_data)
+ 
+    classification = classify_product(
+        title=product.title,
+        description=full_description,
+        image_url=product.image_url,
+        store_name=store.name,
+        colors_hint=colors_hint if colors_hint else None,
+    )
+ 
+    # Guardar
+    product.category         = classification["category"]
+    product.subcategory      = classification["subcategory"]
+    product.colors           = classification["colors"]
+    product.style_tags       = classification["style_tags"]
+    product.gender           = classification["gender"]
+    product.condition        = classification.get("condition", "new")
+    product.cut              = classification.get("cut")
+    product.leg_cut          = classification.get("leg_cut")
+    product.rise             = classification.get("rise")
+    product.length           = classification.get("length")
+    product.materials        = classification.get("materials", [])
+    product.texture          = classification.get("texture")
+    product.thickness        = classification.get("thickness")
+    product.stretch          = classification.get("stretch")
+    product.colors_secondary = classification.get("colors_secondary", [])
+    product.pattern          = classification.get("pattern")
+    product.design_details   = classification.get("design_details", [])
+    product.neck_type        = classification.get("neck_type")
+    product.sleeve_type      = classification.get("sleeve_type")
+    product.hem_finish       = classification.get("hem_finish")
+    product.ai_classified    = True
+    product.enriched         = True
+ 
+    db.commit()
+ 
+    return {
+        "product_id":   product.id,
+        "title":        product.title,
+        "category":     product.category,
+        "subcategory":  product.subcategory,
+        "colors":       product.colors,
+        "style_tags":   product.style_tags,
+        "gender":       product.gender,
+        "neck_type":    product.neck_type,
+        "sleeve_type":  product.sleeve_type,
+        "ai_classified": True,
+        "enriched":     True,
+    }
+    
 # ─── Búsqueda ──────────────────────────────────────────────────────────────────
 
 @router.post("/search", response_model=SearchResponse, tags=["Búsqueda"])

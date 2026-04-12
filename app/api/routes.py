@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from app.core.database import get_db
@@ -11,34 +11,21 @@ from app.models.schemas import (
     ScrapeResponse, StatsResponse,
     ScrapeLogRead, StoreEnrichStatus,
 )
-from app.services.scraping_service import scrape_and_save
+from app.services.scraping_service import scrape_and_save, delete_unavailable_products
 from app.services.search_service import search_products
 from app.services.enrichment_service import run_enrichment_job, get_enrichment_status
 from app.api.ai_routes import ai_router
 from app.api.auth import auth_router, require_admin
-from app.core.rate_limiter import limiter, LIMIT_ENRICH, LIMIT_SCRAPE, LIMIT_SCRAPE_ALL
 
 router = APIRouter()
 router.include_router(auth_router)
 router.include_router(ai_router)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Mapa de protección de endpoints
-# 🔓 Público:    GET /stores, GET /stores/{id}, POST /search, GET /stats,
-#                GET /enrich/status, GET /scrape-logs/{store_id}, GET /ai/stats
-# 🔒 require_admin: todo lo que escribe, scrapea o clasifica
-# 🚦 rate_limited: endpoints que llaman a IA o generan carga de red/CPU
-# ─────────────────────────────────────────────────────────────────────────────
-
 
 # ─── Stores ────────────────────────────────────────────────────────────────────
 
 @router.post("/stores", response_model=StoreRead, status_code=201, tags=["Tiendas"])
-def create_store(
-    store_data: StoreCreate,
-    db: Session = Depends(get_db),
-    _: dict = Depends(require_admin),          # 🔒
-):
+def create_store(store_data: StoreCreate, db: Session = Depends(get_db), _: dict = Depends(require_admin)):
     existing = db.query(Store).filter(Store.url == store_data.url).first()
     if existing:
         raise HTTPException(status_code=409, detail="Ya existe una tienda con esa URL")
@@ -50,7 +37,7 @@ def create_store(
 
 
 @router.get("/stores", response_model=list[StoreRead], tags=["Tiendas"])
-def list_stores(location: str = None, db: Session = Depends(get_db)):   # 🔓
+def list_stores(location: str = None, db: Session = Depends(get_db)):
     query = db.query(Store)
     if location:
         term = f"%{location.lower()}%"
@@ -62,7 +49,7 @@ def list_stores(location: str = None, db: Session = Depends(get_db)):   # 🔓
 
 
 @router.get("/stores/{store_id}", response_model=StoreRead, tags=["Tiendas"])
-def get_store(store_id: int, db: Session = Depends(get_db)):             # 🔓
+def get_store(store_id: int, db: Session = Depends(get_db)):
     store = db.query(Store).filter(Store.id == store_id).first()
     if not store:
         raise HTTPException(status_code=404, detail="Tienda no encontrada")
@@ -70,11 +57,7 @@ def get_store(store_id: int, db: Session = Depends(get_db)):             # 🔓
 
 
 @router.delete("/stores/{store_id}", status_code=204, tags=["Tiendas"])
-def delete_store(
-    store_id: int,
-    db: Session = Depends(get_db),
-    _: dict = Depends(require_admin),          # 🔒
-):
+def delete_store(store_id: int, db: Session = Depends(get_db), _: dict = Depends(require_admin)):
     store = db.query(Store).filter(Store.id == store_id).first()
     if not store:
         raise HTTPException(status_code=404, detail="Tienda no encontrada")
@@ -83,11 +66,7 @@ def delete_store(
 
 
 @router.patch("/stores/{store_id}/toggle", response_model=StoreRead, tags=["Tiendas"])
-def toggle_store_active(
-    store_id: int,
-    db: Session = Depends(get_db),
-    _: dict = Depends(require_admin),          # 🔒
-):
+def toggle_store_active(store_id: int, db: Session = Depends(get_db), _: dict = Depends(require_admin)):
     store = db.query(Store).filter(Store.id == store_id).first()
     if not store:
         raise HTTPException(status_code=404, detail="Tienda no encontrada")
@@ -100,12 +79,10 @@ def toggle_store_active(
 # ─── Scraping ──────────────────────────────────────────────────────────────────
 
 @router.post("/scrape/{store_id}", response_model=ScrapeResponse, tags=["Scraping"])
-@limiter.limit(LIMIT_SCRAPE)                                             # 🚦 10/min
 def scrape_store(
-    request: Request,                          # requerido por slowapi
     store_id: int,
     db: Session = Depends(get_db),
-    _: dict = Depends(require_admin),          # 🔒
+    _: dict = Depends(require_admin),
 ):
     store = db.query(Store).filter(Store.id == store_id).first()
     if not store:
@@ -116,11 +93,9 @@ def scrape_store(
 
 
 @router.post("/scrape-all", response_model=list[ScrapeResponse], tags=["Scraping"])
-@limiter.limit(LIMIT_SCRAPE_ALL)                                         # 🚦 5/min
 def scrape_all_stores(
-    request: Request,                          # requerido por slowapi
     db: Session = Depends(get_db),
-    _: dict = Depends(require_admin),          # 🔒
+    _: dict = Depends(require_admin),
 ):
     stores = db.query(Store).filter(Store.active == True).all()  # noqa: E712
     if not stores:
@@ -128,15 +103,20 @@ def scrape_all_stores(
     return [scrape_and_save(store, db) for store in stores]
 
 
-@router.get("/scrape-logs/{store_id}", response_model=list[ScrapeLogRead], tags=["Scraping"])
+@router.get(
+    "/scrape-logs/{store_id}",
+    response_model=list[ScrapeLogRead],
+    tags=["Scraping"],
+)
 def get_scrape_logs(
     store_id: int,
     limit: int = Query(default=10, ge=1, le=100),
-    db: Session = Depends(get_db),             # 🔓 — solo lectura, sin datos sensibles
+    db: Session = Depends(get_db),
 ):
     store = db.query(Store).filter(Store.id == store_id).first()
     if not store:
         raise HTTPException(status_code=404, detail="Tienda no encontrada")
+
     logs = (
         db.query(ScrapeLog)
         .filter(ScrapeLog.store_id == store_id)
@@ -147,40 +127,60 @@ def get_scrape_logs(
     return logs
 
 
+# ─── Limpieza ──────────────────────────────────────────────────────────────────
+
+@router.delete("/cleanup/unavailable", tags=["Scraping"])
+def cleanup_unavailable_products(
+    days: int = Query(default=7, ge=1, le=365, description="Días sin aparecer para eliminar el producto"),
+    store_id: int = Query(default=None, description="Filtrar por tienda específica (opcional)"),
+    db: Session = Depends(get_db),
+    _: dict = Depends(require_admin),
+):
+    """
+    Elimina manualmente productos con available=False cuyo updated_at
+    supera `days` días. Si store_id no se especifica, limpia todas las tiendas.
+
+    Los scrapings automáticos ya hacen esta limpieza para 7 días,
+    pero este endpoint permite forzarla con un umbral distinto o por tienda.
+    """
+    if store_id is not None:
+        store = db.query(Store).filter(Store.id == store_id).first()
+        if not store:
+            raise HTTPException(status_code=404, detail="Tienda no encontrada")
+
+    result = delete_unavailable_products(db, store_id=store_id, days=days)
+    return {
+        "message": f"{result['deleted_total']} productos eliminados",
+        **result,
+    }
+
+
 # ─── Enriquecimiento ───────────────────────────────────────────────────────────
 
 @router.post("/enrich", tags=["Scraping"])
 def enrich_products(
     batch_size: int = 20,
     store_id: int = None,
-    force: bool = False,
     db: Session = Depends(get_db),
     _: dict = Depends(require_admin),
 ):
-    """
-    Enriquece productos pendientes.
- 
-    - batch_size: cuántos procesar en esta llamada (1-100)
-    - store_id: opcional, limitar a una tienda
-    - force: si True, re-enriquece productos ya clasificados
-             (prioriza los con category='otro')
-    """
     if batch_size < 1 or batch_size > 100:
         raise HTTPException(status_code=400, detail="batch_size debe estar entre 1 y 100")
-    result = run_enrichment_job(db, batch_size=batch_size, store_id=store_id, force=force)
+    result = run_enrichment_job(db, batch_size=batch_size, store_id=store_id)
     status = get_enrichment_status(db)
     return {
         "message": "Enriquecimiento completo",
         "enriched_this_run": result["enriched"],
         "failed_this_run": result["failed"],
-        "force": force,
         "status": status,
     }
- 
 
 
-@router.get("/enrich/status", tags=["Scraping"])
-def enrichment_status(db: Session = Depends(get_db)):                   # 🔓
+@router.get(
+    "/enrich/status",
+    tags=["Scraping"],
+)
+def enrichment_status(db: Session = Depends(get_db)):
     """
     Público — el front lo usa para mostrar progreso de enriquecimiento.
     Incluye el último scrape log de cada tienda.
@@ -231,135 +231,33 @@ def enrichment_status(db: Session = Depends(get_db)):                   # 🔓
 def enrich_store(
     store_id: int,
     batch_size: int = 20,
-    force: bool = False,
     db: Session = Depends(get_db),
     _: dict = Depends(require_admin),
 ):
-    """
-    Enriquece productos de una tienda específica.
- 
-    - force: si True, re-clasifica productos ya enriquecidos de esa tienda
-    """
     store = db.query(Store).filter(Store.id == store_id).first()
     if not store:
         raise HTTPException(status_code=404, detail="Tienda no encontrada")
-    result = run_enrichment_job(db, batch_size=batch_size, store_id=store_id, force=force)
+    result = run_enrichment_job(db, batch_size=batch_size, store_id=store_id)
     status = get_enrichment_status(db)
     return {
         "message": f"Enriquecimiento de {store.name} completo",
         "enriched_this_run": result["enriched"],
         "failed_this_run": result["failed"],
-        "force": force,
         "status": status,
     }
 
-@router.post("/enrich/product/{product_id}", tags=["Scraping"])
-def enrich_single_product(
-    product_id: int,
-    db: Session = Depends(get_db),
-    _: dict = Depends(require_admin),
-):
-    """
-    Re-clasifica un producto individual visitando su página y llamando a la IA.
-    Útil para testing y corrección manual de clasificaciones incorrectas.
-    Devuelve los campos de clasificación actualizados.
-    """
-    from app.services.enrichment_service import ProductEnricher, _build_full_description
-    from app.services.ai_classifier import classify_product
- 
-    product = db.query(Product).filter(Product.id == product_id).first()
-    if not product:
-        raise HTTPException(status_code=404, detail="Producto no encontrado")
- 
-    store = db.query(Store).filter(Store.id == product.store_id).first()
-    if not store:
-        raise HTTPException(status_code=404, detail="Tienda no encontrada")
- 
-    # Resetear flags
-    product.enriched = False
-    product.ai_classified = False
-    db.flush()
- 
-    # Visitar página y extraer datos
-    enricher = ProductEnricher()
-    enriched_data = enricher.enrich_product(product, store)
- 
-    # Actualizar campos de página
-    page_description = enriched_data.get("description")
-    if page_description:
-        if not product.description or len(page_description) > len(product.description or ""):
-            product.description = page_description
- 
-    if enriched_data.get("materials_raw"):
-        product.materials_raw = enriched_data["materials_raw"]
- 
-    if enriched_data.get("sizes"):
-        product.sizes = enriched_data["sizes"]
- 
-    colors_hint = enriched_data.get("colors_hint") or []
- 
-    # Clasificar con IA
-    full_description = _build_full_description(product, enriched_data)
- 
-    classification = classify_product(
-        title=product.title,
-        description=full_description,
-        image_url=product.image_url,
-        store_name=store.name,
-        colors_hint=colors_hint if colors_hint else None,
-    )
- 
-    # Guardar
-    product.category         = classification["category"]
-    product.subcategory      = classification["subcategory"]
-    product.colors           = classification["colors"]
-    product.style_tags       = classification["style_tags"]
-    product.gender           = classification["gender"]
-    product.condition        = classification.get("condition", "new")
-    product.cut              = classification.get("cut")
-    product.leg_cut          = classification.get("leg_cut")
-    product.rise             = classification.get("rise")
-    product.length           = classification.get("length")
-    product.materials        = classification.get("materials", [])
-    product.texture          = classification.get("texture")
-    product.thickness        = classification.get("thickness")
-    product.stretch          = classification.get("stretch")
-    product.colors_secondary = classification.get("colors_secondary", [])
-    product.pattern          = classification.get("pattern")
-    product.design_details   = classification.get("design_details", [])
-    product.neck_type        = classification.get("neck_type")
-    product.sleeve_type      = classification.get("sleeve_type")
-    product.hem_finish       = classification.get("hem_finish")
-    product.ai_classified    = True
-    product.enriched         = True
- 
-    db.commit()
- 
-    return {
-        "product_id":   product.id,
-        "title":        product.title,
-        "category":     product.category,
-        "subcategory":  product.subcategory,
-        "colors":       product.colors,
-        "style_tags":   product.style_tags,
-        "gender":       product.gender,
-        "neck_type":    product.neck_type,
-        "sleeve_type":  product.sleeve_type,
-        "ai_classified": True,
-        "enriched":     True,
-    }
-    
+
 # ─── Búsqueda ──────────────────────────────────────────────────────────────────
 
 @router.post("/search", response_model=SearchResponse, tags=["Búsqueda"])
-def search(request: SearchRequest, db: Session = Depends(get_db)):       # 🔓
+def search(request: SearchRequest, db: Session = Depends(get_db)):
     return search_products(request, db)
 
 
 # ─── Estadísticas ──────────────────────────────────────────────────────────────
 
 @router.get("/stats", response_model=StatsResponse, tags=["Estadísticas"])
-def get_stats(db: Session = Depends(get_db)):                            # 🔓
+def get_stats(db: Session = Depends(get_db)):
     total_stores        = db.query(Store).count()
     active_stores       = db.query(Store).filter(Store.active == True).count()         # noqa: E712
     total_products      = db.query(Product).count()

@@ -6,9 +6,10 @@ Servicio de scraping que coordina:
 4. Guardar productos nuevos con enriched=False
 5. Actualizar precio/disponibilidad de productos existentes
 6. Registrar un ScrapeLog por cada ejecución (éxito o error)
+7. Eliminar productos unavailable con más de 7 días de antigüedad
 """
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
@@ -22,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 TIENDANUBE_DOMAINS = ["mitiendanube.com", "tiendanube.com"]
 LOW_YIELD_THRESHOLD = 0.20  # si scraped < 20% del histórico → no marcar ausentes
+UNAVAILABLE_TTL_DAYS = 7    # días hasta eliminar productos unavailable
 
 
 def _get_scraper(store):
@@ -48,6 +50,9 @@ def scrape_and_save(store: Store, db: Session) -> ScrapeResponse:
     Guarda un warning en el log y omite _mark_missing_as_unavailable()
     si los productos scrapeados son menos del 20% del total histórico,
     para evitar desactivar el catálogo entero por un scraping parcial.
+
+    Al finalizar exitosamente, elimina productos unavailable con más de
+    UNAVAILABLE_TTL_DAYS días de antigüedad para esa tienda.
     """
     scraper       = _get_scraper(store)
     errors        = []
@@ -164,9 +169,14 @@ def scrape_and_save(store: Store, db: Session) -> ScrapeResponse:
     else:
         _mark_missing_as_unavailable(db, store.id, raw_products)
 
+    # ── 4. Eliminar productos unavailable viejos ──────────────────────────────
+    deleted_count = _delete_old_unavailable(db, store.id, days=UNAVAILABLE_TTL_DAYS)
+    if deleted_count > 0:
+        logger.info(f"[{store.name}] {deleted_count} productos unavailable eliminados (>{UNAVAILABLE_TTL_DAYS}d)")
+
     store.last_scraped = datetime.utcnow()
 
-    # ── 4. Guardar log ────────────────────────────────────────────────────────
+    # ── 5. Guardar log ────────────────────────────────────────────────────────
     all_messages = [m for m in [warning] + errors if m]
     _write_scrape_log(
         db,
@@ -177,14 +187,14 @@ def scrape_and_save(store: Store, db: Session) -> ScrapeResponse:
         products_new=new_count,
         products_updated=updated_count,
         error_message="; ".join(all_messages) if all_messages else None,
-        success=len(errors) == 0,  # warning no cuenta como fallo
+        success=len(errors) == 0,
     )
 
     db.commit()
 
     logger.info(
-        f"Tienda {store.name}: {new_count} nuevos, {updated_count} actualizados. "
-        f"Errores parciales: {len(errors)}"
+        f"Tienda {store.name}: {new_count} nuevos, {updated_count} actualizados, "
+        f"{deleted_count} eliminados. Errores parciales: {len(errors)}"
     )
 
     return ScrapeResponse(
@@ -197,7 +207,64 @@ def scrape_and_save(store: Store, db: Session) -> ScrapeResponse:
     )
 
 
+def delete_unavailable_products(db: Session, store_id: int = None, days: int = UNAVAILABLE_TTL_DAYS) -> dict:
+    """
+    Elimina productos con available=False cuyo updated_at supera `days` días.
+    Si store_id es None, limpia todas las tiendas.
+    Retorna conteo de eliminados por tienda.
+    """
+    cutoff = datetime.utcnow() - timedelta(days=days)
+
+    query = db.query(Product).filter(
+        Product.available == False,       # noqa: E712
+        Product.updated_at <= cutoff,
+    )
+    if store_id is not None:
+        query = query.filter(Product.store_id == store_id)
+
+    products_to_delete = query.all()
+
+    # Agrupar por tienda para el log
+    by_store: dict[int, int] = {}
+    for p in products_to_delete:
+        by_store[p.store_id] = by_store.get(p.store_id, 0) + 1
+        db.delete(p)
+
+    total = len(products_to_delete)
+    if total > 0:
+        db.commit()
+        logger.info(f"Limpieza manual: {total} productos eliminados. Por tienda: {by_store}")
+    else:
+        logger.info("Limpieza manual: no había productos unavailable para eliminar")
+
+    return {
+        "deleted_total": total,
+        "days_threshold": days,
+        "by_store": by_store,
+    }
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _delete_old_unavailable(db: Session, store_id: int, days: int = UNAVAILABLE_TTL_DAYS) -> int:
+    """
+    Elimina productos de una tienda con available=False
+    cuyo updated_at supera `days` días.
+    No hace commit — se commitea junto con el resto del scraping.
+    """
+    cutoff = datetime.utcnow() - timedelta(days=days)
+
+    products_to_delete = db.query(Product).filter(
+        Product.store_id  == store_id,
+        Product.available == False,       # noqa: E712
+        Product.updated_at <= cutoff,
+    ).all()
+
+    for p in products_to_delete:
+        db.delete(p)
+
+    return len(products_to_delete)
+
 
 def _write_scrape_log(
     db: Session,
@@ -210,11 +277,6 @@ def _write_scrape_log(
     error_message: Optional[str],
     success: bool,
 ) -> None:
-    """
-    Inserta un ScrapeLog en la sesión activa.
-    No hace commit propio — se commitea junto con el resto.
-    Silencia excepciones para no romper el flujo principal.
-    """
     try:
         db.add(ScrapeLog(
             store_id=store_id,

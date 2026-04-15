@@ -1,10 +1,14 @@
 """
-auth.py — Autenticación con JWT en httpOnly cookie.
+auth.py — Autenticación con JWT.
+
+Soporta dos métodos:
+  1. httpOnly cookie (legacy / mismo dominio)
+  2. Bearer token en header Authorization (cross-site / Railway)
 
 Flujo:
-  POST /api/auth/login   →  Set-Cookie: token=<jwt>; HttpOnly; SameSite=Lax
+  POST /api/auth/login   →  devuelve { token, expires_in } + Set-Cookie opcional
   POST /api/auth/logout  →  borra la cookie
-  GET  /api/auth/me      →  verifica que la cookie siga siendo válida
+  GET  /api/auth/me      →  verifica que el token siga siendo válido
 
 Configurar en .env:
   ADMIN_USERNAME=admin
@@ -82,12 +86,24 @@ def verify_token(token: str) -> dict:
 
 def require_admin(request: Request):
     """
-    Lee el JWT desde la httpOnly cookie.
-    Uso: def my_endpoint(..., _: dict = Depends(require_admin))
+    Lee el JWT desde:
+      1. Header Authorization: Bearer <token>  ← prioridad (cross-site)
+      2. httpOnly cookie admin_token            ← fallback (mismo dominio)
     """
-    token = request.cookies.get(COOKIE_NAME)
+    token = None
+
+    # 1. Intentar desde header Authorization
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:]
+
+    # 2. Fallback: cookie httpOnly
+    if not token:
+        token = request.cookies.get(COOKIE_NAME)
+
     if not token:
         raise HTTPException(status_code=401, detail="Token requerido")
+
     try:
         return verify_token(token)
     except ValueError as e:
@@ -103,7 +119,8 @@ class LoginRequest(BaseModel):
 @auth_router.post("/login")
 def login(body: LoginRequest, response: Response):
     """
-    Valida credenciales y setea un httpOnly cookie con el JWT.
+    Valida credenciales y devuelve el JWT en el body.
+    También setea la httpOnly cookie por compatibilidad.
     ADMIN_PASSWORD debe ser un hash bcrypt.
     """
     username_ok = body.username == settings.ADMIN_USERNAME
@@ -121,21 +138,23 @@ def login(body: LoginRequest, response: Response):
 
     token = create_token(body.username)
 
-    # secure=True solo en producción (requiere HTTPS)
-    is_production = getattr(settings, "ENVIRONMENT", "development") == "production"
-
+    # Cookie como fallback (puede ser bloqueada en cross-site por Chrome)
     response.set_cookie(
         key=COOKIE_NAME,
         value=token,
-        httponly=True,           # JavaScript no puede leerla
-        samesite="none",# protege contra CSRF en navegación normal
-        secure=True,    # True en prod → solo HTTPS
+        httponly=True,
+        samesite="none",
+        secure=True,
         max_age=TOKEN_TTL_SECONDS,
         path="/",
     )
 
     logger.info(f"Login exitoso: {body.username}")
-    return {"message": "Login exitoso", "expires_in": TOKEN_TTL_SECONDS}
+    return {
+        "message": "Login exitoso",
+        "token": token,                  # ← el frontend lo guarda en localStorage
+        "expires_in": TOKEN_TTL_SECONDS,
+    }
 
 
 @auth_router.post("/logout")
@@ -147,5 +166,5 @@ def logout(response: Response):
 
 @auth_router.get("/me")
 def me(payload: dict = Depends(require_admin)):
-    """Verifica que la cookie siga siendo válida. Útil para el front al recargar."""
+    """Verifica que el token siga siendo válido. Útil para el front al recargar."""
     return {"username": payload["sub"], "exp": payload["exp"]}

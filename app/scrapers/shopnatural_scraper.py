@@ -1,20 +1,19 @@
 """
 Scraper para shopnatural.ar — WooCommerce con tema Flatsome.
 
-Problemas específicos del sitio:
-1. Imágenes con lazy loading: el src inicial es un SVG placeholder.
-   La imagen real está en data-src o en el segundo <img> (hover).
-2. Precios con descuento: hay precio tachado (original) y precio actual,
-   el selector .woocommerce-Price-amount matchea ambos.
-3. Links en español: /producto/ en vez de /product/
-4. Paginación: /shop/page/2/
-
-Estrategia: subclasear WooCommerceScraper y pisar los métodos problemáticos.
+Diferencias con WooCommerceScraper estándar:
+1. Contenedor: div.product-small  (NO li.product — Flatsome usa divs)
+2. Imágenes:   data-src en el primer <img> (lazy loading)
+3. Precios:    <del> = original, <ins> = actual → tomar siempre <ins>
+4. ID externo: data-prod en el botón "Vista Rápida"
+5. Título:     p.name.product-title > a  o  p.woocommerce-loop-product__title > a
+6. URL:        a.woocommerce-LoopProduct-link
+7. Paginación: /shop/page/N/  (ya soportada por WooCommerceScraper base)
+8. Stock:      clase out-of-stock en el div contenedor
 """
-import re
 import logging
 from typing import Optional
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 from app.scrapers.woocommerce_scraper import WooCommerceScraper
 
@@ -23,25 +22,29 @@ logger = logging.getLogger(__name__)
 
 class ShopNaturalScraper(WooCommerceScraper):
     """
-    Scraper para shopnatural.ar.
-    Extiende WooCommerceScraper corrigiendo lazy-loading de imágenes
-    y extracción de precio actual (ignora el tachado).
+    Scraper para shopnatural.ar (tema Flatsome).
+    Sobreescribe _extract_products y _extract_single del padre.
     """
+
+    def _extract_products(self, soup: BeautifulSoup, base_url: str) -> list[dict]:
+        # Flatsome usa div.product-small, no li.product
+        items = soup.select("div.product-small")
+        logger.info(f"  → div.product-small encontrados: {len(items)}")
+        return [p for p in (self._extract_single(item, base_url) for item in items) if p]
 
     def _extract_single(self, item, base_url: str) -> Optional[dict]:
         try:
             # ── ID externo ────────────────────────────────────────────────────
+            # En Flatsome el ID está en data-prod del botón "Vista Rápida"
             external_id = None
-            btn = item.select_one("[data-product_id]")
-            if btn:
-                external_id = btn.get("data-product_id") or btn.get("data-product-id")
+            qv_btn = item.select_one("[data-prod]")
+            if qv_btn:
+                external_id = qv_btn.get("data-prod")
 
             # ── URL del producto ──────────────────────────────────────────────
-            # Flatsome usa a.woocommerce-LoopProduct-link o directamente el primer <a>
             link = (
                 item.select_one("a.woocommerce-LoopProduct-link") or
                 item.select_one("a[href*='/producto/']") or
-                item.select_one("a.product-item-link") or
                 item.find("a", href=True)
             )
             if not link:
@@ -53,87 +56,85 @@ class ShopNaturalScraper(WooCommerceScraper):
                 product_url = urljoin(base_url, product_url)
 
             # ── Título ────────────────────────────────────────────────────────
-            # Flatsome: h3.product-title > a   o   .woocommerce-loop-product__title
+            # Flatsome: <p class="name product-title woocommerce-loop-product__title">
+            #             <a href="...">Nombre del producto</a>
+            #           </p>
             title = None
             for sel in [
-                "h3.product-title a",
-                "h3.product-title",
-                "h2.woocommerce-loop-product__title",
-                ".product-title",
-                "h3", "h2",
+                "p.name.product-title a",
+                "p.woocommerce-loop-product__title a",
+                ".product-title a",
+                "h3 a", "h2 a",
             ]:
                 el = item.select_one(sel)
                 if el and el.get_text(strip=True):
                     title = el.get_text(strip=True)
                     break
 
-            # Fallback: aria-label del botón
+            # Fallback: alt de la imagen principal (no la de hover)
             if not title:
-                add_btn = item.select_one("a.add_to_cart_button, a.product_type_variable")
-                if add_btn:
-                    aria = add_btn.get("aria-label", "")
-                    match = re.search(r'"([^"]+)"', aria)
-                    if match:
-                        title = match.group(1).strip()
-
-            if not title:
-                img = item.select_one("img")
-                if img:
-                    title = img.get("alt", "").strip()
+                for img in item.select("img[alt]"):
+                    alt = img.get("alt", "").strip()
+                    if alt and not alt.startswith("Alternative view"):
+                        title = alt
+                        break
 
             if not title:
                 return None
 
-            # ── Precio — tomar el precio ACTUAL (no el tachado) ───────────────
-            # Flatsome con descuento: <del>$26.000</del> <ins>$20.000</ins>
-            # Sin descuento: simplemente .woocommerce-Price-amount
+            # ── Precio — tomar siempre el precio actual (<ins>) ───────────────
+            # Con descuento: <del>$26.000</del> <ins>$20.000</ins>
+            # Sin descuento: <span class="woocommerce-Price-amount">$27.000</span>
             price = None
 
-            # Primero intentar precio <ins> (precio con descuento = precio actual)
-            ins_el = item.select_one("ins .woocommerce-Price-amount, ins .amount")
+            ins_el = item.select_one("ins .woocommerce-Price-amount")
             if ins_el:
                 price = self._parse_price(ins_el.get_text(strip=True))
 
-            # Si no hay <ins>, tomar el único precio disponible
             if price is None:
-                # Excluir el <del> (precio original tachado)
-                for el in item.select("del"):
-                    el.decompose()  # sacar del árbol temporalmente
-                price_el = item.select_one(".woocommerce-Price-amount, .amount")
+                # Sin descuento: precio único — clonar el item para no mutar el árbol
+                from copy import copy
+                item_copy = copy(item)
+                for del_el in item_copy.select("del"):
+                    del_el.decompose()
+                price_el = item_copy.select_one(".woocommerce-Price-amount")
                 if price_el:
                     price = self._parse_price(price_el.get_text(strip=True))
 
-            # ── Imagen — manejar lazy loading de Flatsome ─────────────────────
-            # Flatsome carga imágenes con data-src o pone un SVG placeholder en src.
-            # El <img> real puede tener: data-src, data-lazy-src, o srcset.
-            # También hay dos <img>: la principal y la de hover (segunda).
+            # ── Imagen — Flatsome usa lazy loading con data-src ───────────────
+            # Estructura típica:
+            #   <img src="real.jpg" ...>              ← primera imagen (principal)
+            #   <img src="data:svg" data-src="hover.jpg" class="lazy-load show-on-hover ...">
+            #
+            # Saltar siempre las imágenes de hover (show-on-hover / back-image).
             image_url = None
-            imgs = item.select("img")
+            for img in item.select("img"):
+                classes = img.get("class", [])
+                if "show-on-hover" in classes or "back-image" in classes:
+                    continue
 
-            for img in imgs:
                 src = None
 
-                # Prioridad: data-src > data-lazy-src > srcset > src
-                for attr in ["data-src", "data-lazy-src", "data-original"]:
+                # data-src tiene la URL real con lazy load
+                for attr in ["data-src", "data-lazy-src"]:
                     val = img.get(attr, "")
                     if val and not val.startswith("data:"):
                         src = val
                         break
 
-                # Intentar srcset si todavía no tenemos nada
+                # src directo (primer producto de la página, cargado sin lazy)
+                if not src:
+                    raw = img.get("src", "")
+                    if raw and not raw.startswith("data:"):
+                        src = raw
+
+                # srcset como último recurso
                 if not src:
                     srcset = img.get("srcset") or img.get("data-srcset", "")
                     if srcset:
-                        # Tomar la URL más grande del srcset
                         entries = [s.strip().split()[0] for s in srcset.split(",") if s.strip()]
                         if entries:
-                            src = entries[-1]
-
-                # Fallback: src directo si no es placeholder SVG
-                if not src:
-                    raw_src = img.get("src", "")
-                    if raw_src and not raw_src.startswith("data:"):
-                        src = raw_src
+                            src = entries[0]
 
                 if src:
                     if src.startswith("//"):
@@ -141,16 +142,20 @@ class ShopNaturalScraper(WooCommerceScraper):
                     elif not src.startswith("http"):
                         src = urljoin(base_url, src)
                     image_url = src
-                    break  # usar la primera imagen válida encontrada
+                    break
+
+            # ── Stock ─────────────────────────────────────────────────────────
+            classes = item.get("class", [])
+            available = "outofstock" not in classes and "out-of-stock" not in classes
 
             return {
                 "external_id": str(external_id) if external_id else None,
-                "title": title,
+                "title":       title,
                 "description": None,
-                "price": price,
-                "image_url": image_url,
+                "price":       price,
+                "image_url":   image_url,
                 "product_url": product_url,
-                "available": "outofstock" not in item.get("class", []),
+                "available":   available,
             }
 
         except Exception as e:
@@ -158,7 +163,6 @@ class ShopNaturalScraper(WooCommerceScraper):
             return None
 
     def _has_next_page(self, soup: BeautifulSoup) -> bool:
-        # Flatsome usa los mismos selectores estándar de WooCommerce
         return bool(
             soup.select_one("a.next.page-numbers") or
             soup.select_one(".woocommerce-pagination .next") or

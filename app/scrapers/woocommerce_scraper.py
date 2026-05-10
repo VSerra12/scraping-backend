@@ -10,6 +10,12 @@ Estructura HTML de WooCommerce (tema Mixtas/Kitify):
 - Imagen:      img.attachment-woocommerce_thumbnail src
 - Precio:      .price .woocommerce-Price-amount
 - Paginación:  a.next.page-numbers
+
+FIX: Se excluyen productos con clase CSS "hidden" en li.product.
+     WooCommerce agrega esa clase cuando la visibilidad del producto
+     es "Hidden" — aparecen en categorías pero NO en /shop/.
+     Sin este filtro el scraper los levantaba al scrapear URLs de
+     categorías específicas (ej: /product-category/shop/denim/).
 """
 import re
 import logging
@@ -45,7 +51,7 @@ class WooCommerceScraper(BaseScraper):
                 break
 
             raw_count = len(soup.select("li.product"))
-            logger.info(f"  → li.product encontrados: {raw_count}")
+            logger.info(f"  → li.product encontrados (antes de filtrar): {raw_count}")
 
             if raw_count == 0:
                 logger.info(f"Sin productos en página {page_num}, deteniendo.")
@@ -53,7 +59,7 @@ class WooCommerceScraper(BaseScraper):
 
             page_products = self._extract_products(soup, base_url)
             products.extend(page_products)
-            logger.info(f"  → {len(page_products)} productos extraídos")
+            logger.info(f"  → {len(page_products)} productos extraídos (después de filtrar hidden)")
 
             if not self._has_next_page(soup):
                 logger.info("No hay página siguiente, deteniendo.")
@@ -64,6 +70,18 @@ class WooCommerceScraper(BaseScraper):
 
     def _extract_products(self, soup: BeautifulSoup, base_url: str) -> list[dict]:
         items = soup.select("li.product")
+
+        # FIX: excluir productos con visibilidad "Hidden" en WooCommerce.
+        # Cuando un producto está configurado como "Hidden" (oculto del catálogo),
+        # WooCommerce le agrega la clase CSS "hidden" al li.product.
+        # Esos productos NO aparecen en /shop/ pero sí en URLs de categorías,
+        # por eso el scraper los levantaba de más (ej: los 46 extra en Dynamic Jeans).
+        before = len(items)
+        items = [item for item in items if "hidden" not in item.get("class", [])]
+        after = len(items)
+        if before != after:
+            logger.info(f"  → Filtrados {before - after} productos hidden del catálogo")
+
         return [p for p in (self._extract_single(item, base_url) for item in items) if p]
 
     def _extract_single(self, item, base_url: str) -> Optional[dict]:
@@ -84,12 +102,14 @@ class WooCommerceScraper(BaseScraper):
             if not product_url.startswith("http"):
                 product_url = urljoin(base_url, product_url)
 
-            # Título — extraer del aria-label del botón (ej: 'Elige las opciones para "MICHIGAN RAYADO"')
+            # Título — extraer del aria-label del botón
+            # (ej: 'Elige las opciones para "MICHIGAN RAYADO"')
             title = None
             add_btn = item.select_one("a.add_to_cart_button, a.product_type_variable")
             if add_btn:
                 aria = add_btn.get("aria-label", "")
-                # El aria-label tiene formato: 'Elige las opciones para "NOMBRE"' o 'Añadir al carrito: "NOMBRE"'
+                # El aria-label tiene formato: 'Elige las opciones para "NOMBRE"'
+                # o 'Añadir al carrito: "NOMBRE"'
                 match = re.search(r'"([^"]+)"', aria)
                 if match:
                     title = match.group(1).strip()
@@ -113,7 +133,11 @@ class WooCommerceScraper(BaseScraper):
 
             # Precio
             price = None
-            price_el = item.select_one(".price .woocommerce-Price-amount, .price ins .woocommerce-Price-amount, .price .amount")
+            price_el = item.select_one(
+                ".price .woocommerce-Price-amount, "
+                ".price ins .woocommerce-Price-amount, "
+                ".price .amount"
+            )
             if price_el:
                 price = self._parse_price(price_el.get_text(strip=True))
             if price is None:
@@ -124,13 +148,19 @@ class WooCommerceScraper(BaseScraper):
 
             # Imagen
             image_url = None
-            img = item.select_one("img.attachment-woocommerce_thumbnail, img.wp-post-image, img")
+            img = item.select_one(
+                "img.attachment-woocommerce_thumbnail, img.wp-post-image, img"
+            )
             if img:
                 src = img.get("src") or img.get("data-src") or ""
                 if src and not src.startswith("data:"):
                     if not src.startswith("http"):
                         src = urljoin(base_url, src)
                     image_url = src
+
+            # "outofstock" en las clases del li indica que está agotado
+            # (distinto de "hidden" que indica que está oculto del catálogo)
+            available = "outofstock" not in item.get("class", [])
 
             return {
                 "external_id": str(external_id) if external_id else None,
@@ -139,7 +169,7 @@ class WooCommerceScraper(BaseScraper):
                 "price": price,
                 "image_url": image_url,
                 "product_url": product_url,
-                "available": "outofstock" not in item.get("class", []),
+                "available": available,
             }
 
         except Exception as e:
@@ -147,7 +177,9 @@ class WooCommerceScraper(BaseScraper):
             return None
 
     def _has_next_page(self, soup: BeautifulSoup) -> bool:
-        return bool(soup.select_one("a.next.page-numbers, .woocommerce-pagination .next, a[rel='next']"))
+        return bool(
+            soup.select_one("a.next.page-numbers, .woocommerce-pagination .next, a[rel='next']")
+        )
 
     def _get_base_url(self, url: str) -> str:
         parsed = urlparse(url)

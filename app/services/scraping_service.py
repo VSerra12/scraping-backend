@@ -30,6 +30,10 @@ def _get_scraper(store):
     url      = store.url or ""
     catalog  = store.catalog_url or ""
     combined = url + catalog
+    
+    if "shopnatural.ar" in combined:
+        from app.scrapers.shopnatural_scraper import ShopNaturalScraper
+        return ShopNaturalScraper()
     if any(d in combined for d in TIENDANUBE_DOMAINS):
         return TiendaNubeScraper()
     if "mpage" in catalog:

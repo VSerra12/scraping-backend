@@ -225,7 +225,105 @@ def enrichment_status(db: Session = Depends(get_db)):
         ))
 
     return {**global_status, "by_store": [s.model_dump() for s in by_store]}
+@router.post("/enrich/product/{product_id}", tags=["Scraping"])
+def enrich_single_product(
+    product_id: int,
+    db: Session = Depends(get_db),
+    _: dict = Depends(require_admin),
+):
+    """
+    Re-clasifica un producto individual con enriquecimiento completo:
+    1. Visita la página del producto para extraer descripción, materiales y talles.
+    2. Clasifica con IA usando toda la info disponible.
+    3. Guarda y devuelve los campos actualizados.
+    """
+    from app.services.enrichment_service import ProductEnricher, _build_full_description
+    from app.services.ai_classifier import classify_product
 
+    product = db.query(Product).filter(Product.id == product_id).first()
+    if not product:
+        raise HTTPException(status_code=404, detail="Producto no encontrado")
+
+    store = db.query(Store).filter(Store.id == product.store_id).first()
+    if not store:
+        raise HTTPException(status_code=404, detail="Tienda no encontrada")
+
+    enricher = ProductEnricher()
+
+    # 1. Visitar página individual
+    enriched_data = enricher.enrich_product(product, store)
+
+    # 2. Actualizar descripción y materiales si se obtuvieron datos nuevos
+    page_description = enriched_data.get("description")
+    if page_description and len(page_description) > len(product.description or ""):
+        product.description = page_description
+
+    if enriched_data.get("materials_raw"):
+        product.materials_raw = enriched_data["materials_raw"]
+
+    if enriched_data.get("sizes"):
+        product.sizes = enriched_data["sizes"]
+
+    colors_hint = enriched_data.get("colors_hint") or []
+
+    # 3. Clasificar con IA
+    full_description = _build_full_description(product, enriched_data)
+
+    classification = classify_product(
+        title=product.title,
+        description=full_description,
+        image_url=product.image_url,
+        store_name=store.name,
+        colors_hint=colors_hint if colors_hint else None,
+    )
+
+    # 4. Guardar todos los campos
+    product.category         = classification["category"]
+    product.subcategory      = classification["subcategory"]
+    product.colors           = classification["colors"]
+    product.style_tags       = classification["style_tags"]
+    product.gender           = classification["gender"]
+    product.condition        = classification.get("condition", "new")
+    product.cut              = classification.get("cut")
+    product.leg_cut          = classification.get("leg_cut")
+    product.rise             = classification.get("rise")
+    product.length           = classification.get("length")
+    product.materials        = classification.get("materials", [])
+    product.texture          = classification.get("texture")
+    product.thickness        = classification.get("thickness")
+    product.stretch          = classification.get("stretch")
+    product.colors_secondary = classification.get("colors_secondary", [])
+    product.pattern          = classification.get("pattern")
+    product.design_details   = classification.get("design_details", [])
+    product.neck_type        = classification.get("neck_type")
+    product.sleeve_type      = classification.get("sleeve_type")
+    product.hem_finish       = classification.get("hem_finish")
+    product.ai_classified    = True
+    product.enriched         = True
+
+    db.commit()
+    db.refresh(product)
+
+    # 5. Devolver los campos que el frontend necesita para actualizar la UI
+    return {
+        "id":             product.id,
+        "category":       product.category,
+        "subcategory":    product.subcategory,
+        "colors":         product.colors,
+        "style_tags":     product.style_tags,
+        "gender":         product.gender,
+        "neck_type":      product.neck_type,
+        "sleeve_type":    product.sleeve_type,
+        "cut":            product.cut,
+        "leg_cut":        product.leg_cut,
+        "rise":           product.rise,
+        "length":         product.length,
+        "materials":      product.materials,
+        "pattern":        product.pattern,
+        "design_details": product.design_details,
+        "ai_classified":  product.ai_classified,
+        "enriched":       product.enriched,
+    }
 
 @router.post("/enrich/{store_id}", tags=["Scraping"])
 def enrich_store(

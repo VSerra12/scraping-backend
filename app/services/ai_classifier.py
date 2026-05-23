@@ -1,9 +1,18 @@
 """
 Servicio de clasificación de productos usando Claude API.
 Solo clasifica productos nuevos — los existentes NO se re-procesan.
+
+Optimizaciones de costo aplicadas:
+- Prompt caching: el system prompt (~1.800 tokens) se cachea entre llamadas
+  del mismo batch, pagando $0.30/MTok en vez de $3/MTok en las relecturas.
+- Imagen condicional: solo se usa imagen cuando el texto es insuficiente
+  para clasificar (título sin palabras clave de prenda + descripción corta).
+- Descripción limpia: se elimina texto de marketing irrelevante antes de
+  mandar al modelo, reduciendo tokens de input innecesarios.
 """
 import json
 import logging
+import re
 import base64
 from typing import Optional
 import httpx
@@ -197,39 +206,6 @@ Título: "Amanda / Polera Manga Larga Algodón y Lycra"
     "condition": "new"
   }
 
-Título: "SANDY" / Descripción: "Remera básica de cuello redondo en suave ribb viscosa"
-→ {
-    "category": "remera",
-    "subcategory": "remera básica cuello redondo manga larga ribb viscosa",
-    "fit": "regular_fit",
-    "neck_type": "redondo",
-    "sleeve_type": "larga",
-    "materials": ["viscosa"],
-    "stretch": false,
-    "colors": ["azul", "azul_marino", "beige", "bordo", "camel"],
-    "pattern": "liso",
-    "style_tags": ["basico", "casual", "minimalista"],
-    "gender": "mujer",
-    "condition": "new"
-  }
-
-Título: "BARBI LOCALIZADO" / Descripción: "Jean tiro alto piernas anchas elastizado"
-→ {
-    "category": "jean",
-    "subcategory": "jean wide leg tiro alto elastizado",
-    "fit": "relaxed_fit",
-    "leg_cut": "wide_leg",
-    "rise": "high_rise",
-    "length": "largo",
-    "materials": ["denim", "elastano"],
-    "stretch": true,
-    "colors": ["negro"],
-    "pattern": "liso",
-    "style_tags": ["casual", "trendy"],
-    "gender": "mujer",
-    "condition": "new"
-  }
-
 Título: "Campera Rompeviento Oversize con Capucha"
 → {
     "category": "campera",
@@ -245,6 +221,33 @@ Título: "Campera Rompeviento Oversize con Capucha"
   }
 """
 
+# Palabras de prenda que hacen suficiente al texto para clasificar sin imagen
+_PRENDA_KEYWORDS = {
+    "remera", "polera", "camiseta", "blusa", "camisa", "top", "musculosa",
+    "crop", "body", "jean", "pantalon", "pantalón", "short", "bermuda",
+    "falda", "pollera", "legging", "calza", "vestido", "blazer", "campera",
+    "tapado", "chaleco", "cardigan", "sweater", "buzo", "hoodie", "jogger",
+    "conjunto", "zapatilla", "chomba",
+}
+
+# Patrones de texto de marketing a eliminar antes de mandar al modelo
+_NOISE_PATTERNS = [
+    r"envío gratis[^\.\n]*",
+    r"env[íi]o gratis[^\.\n]*",
+    r"pag[áa] en \d+[^\.\n]*cuotas[^\.\n]*",
+    r"comprá ahora[^\.\n]*",
+    r"stock limitado[^\.\n]*",
+    r"oferta[^\.\n]*",
+    r"\d+% de descuento[^\.\n]*",
+    r"seguinos en[^\.\n]*",
+    r"visit[áa][^\.\n]*",
+    r"\bwww\.\S+",
+    r"https?://\S+",
+    r"tel[eé]fono[^\.\n]*",
+    r"whatsapp[^\.\n]*",
+]
+_NOISE_RE = re.compile("|".join(_NOISE_PATTERNS), re.IGNORECASE)
+
 USER_TEMPLATE = """=== DATOS DEL PRODUCTO ===
 Título: {title}
 Tienda: {store_context}
@@ -257,12 +260,39 @@ Analizá el título palabra por palabra. "{title_keywords}" son las palabras cla
 Clasificá esta prenda y devolvé SOLO el JSON:"""
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  Helpers de preparación de datos
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _clean_description(text: str) -> str:
+    """
+    Elimina texto de marketing irrelevante para reducir tokens de input.
+    Limita a 600 caracteres (suficiente para clasificar, vs 800 anterior).
+    """
+    cleaned = _NOISE_RE.sub("", text)
+    # Colapsar espacios/líneas múltiples que quedaron
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    return cleaned[:600]
+
+
+def _text_is_sufficient(title: str, description: Optional[str]) -> bool:
+    """
+    Determina si el texto solo alcanza para clasificar sin necesitar imagen.
+    True cuando:
+      - El título contiene una palabra de tipo de prenda conocida, O
+      - Hay descripción con más de 80 caracteres útiles.
+    """
+    title_lower = title.lower()
+    has_prenda_keyword = any(kw in title_lower for kw in _PRENDA_KEYWORDS)
+    has_good_description = bool(description and len(description.strip()) > 80)
+    return has_prenda_keyword or has_good_description
+
+
 def _extract_title_keywords(title: str) -> str:
     """Extrae las palabras más relevantes del título para enfatizarlas en el prompt."""
     keywords = []
     title_lower = title.lower()
 
-    # Tipo de prenda
     prenda_words = [
         "remera", "polera", "camiseta", "blusa", "camisa", "top", "musculosa",
         "crop", "body", "jean", "pantalon", "short", "bermuda", "falda", "pollera",
@@ -273,7 +303,6 @@ def _extract_title_keywords(title: str) -> str:
         if word in title_lower:
             keywords.append(word)
 
-    # Cuello
     cuello_words = [
         "cuello alto", "tortuga", "cuello v", "cuello redondo", "escote v",
         "cuello bote", "manga larga", "manga corta", "sin mangas", "cropped",
@@ -283,7 +312,6 @@ def _extract_title_keywords(title: str) -> str:
         if phrase in title_lower:
             keywords.append(phrase)
 
-    # Materiales en título
     mat_words = [
         "algodón", "algodon", "lycra", "denim", "jean", "morley", "viscosa",
         "lino", "lana", "seda", "modal", "ribb", "rib"
@@ -293,61 +321,6 @@ def _extract_title_keywords(title: str) -> str:
             keywords.append(word)
 
     return ", ".join(keywords) if keywords else title[:50]
-
-
-def classify_product(
-    title: str,
-    description: Optional[str] = None,
-    image_url: Optional[str] = None,
-    store_name: Optional[str] = None,
-    colors_hint: Optional[list] = None,
-) -> dict:
-    """
-    Clasifica un producto con IA.
-    Usa imagen si está disponible, con fallback a solo texto.
-    colors_hint: colores reales extraídos de variantes (más precisos que IA).
-    """
-    desc = description or "Sin descripción disponible — clasificar por título e imagen"
-    store_context = store_name or "tienda de ropa argentina"
-
-    # Extraer materiales de la descripción
-    materials_text = _extract_materials_from_text(title, description)
-
-    # Construir línea de colores hint
-    colors_line = ""
-    if colors_hint:
-        colors_normalized = _normalize_colors(colors_hint)
-        colors_line = f"Colores reales de variantes (USAR ESTOS en el campo 'colors'): {', '.join(colors_normalized)}"
-
-    # Keywords del título para enfatizar
-    title_keywords = _extract_title_keywords(title)
-
-    prompt = USER_TEMPLATE.format(
-        title=title,
-        description=desc[:800],
-        materials=materials_text,
-        store_context=store_context,
-        colors_line=colors_line,
-        title_keywords=title_keywords,
-    )
-
-    # Intentar con imagen primero
-    if image_url:
-        result = _classify_with_image(prompt, image_url)
-        if result:
-            if colors_hint:
-                result["colors"] = _normalize_colors(colors_hint)[:8]
-            return result
-        logger.info(f"Imagen falló para '{title[:40]}', usando solo texto")
-
-    # Fallback a solo texto
-    result = _classify_text_only(prompt)
-
-    # Siempre respetar colors_hint si está disponible
-    if colors_hint:
-        result["colors"] = _normalize_colors(colors_hint)[:8]
-
-    return result
 
 
 def _extract_materials_from_text(title: str, description: Optional[str]) -> str:
@@ -421,6 +394,77 @@ def _normalize_colors(colors: list) -> list:
     return normalized if normalized else ["negro"]
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  Función principal
+# ─────────────────────────────────────────────────────────────────────────────
+
+def classify_product(
+    title: str,
+    description: Optional[str] = None,
+    image_url: Optional[str] = None,
+    store_name: Optional[str] = None,
+    colors_hint: Optional[list] = None,
+) -> dict:
+    """
+    Clasifica un producto con IA.
+
+    Lógica de uso de imagen (para reducir costo):
+      - Si el texto es suficiente (título con keyword de prenda O descripción > 80 chars)
+        → clasifica solo con texto (más barato).
+      - Si el texto es insuficiente (título ambiguo como "EMILY" sin descripción)
+        → intenta con imagen, con fallback a texto.
+
+    colors_hint: colores reales extraídos de variantes (más precisos que IA).
+    """
+    # Limpiar descripción antes de cualquier uso
+    clean_desc = _clean_description(description) if description else None
+
+    desc_for_prompt = clean_desc or "Sin descripción disponible — clasificar por título e imagen"
+    store_context = store_name or "tienda de ropa argentina"
+    materials_text = _extract_materials_from_text(title, clean_desc)
+
+    colors_line = ""
+    if colors_hint:
+        colors_normalized = _normalize_colors(colors_hint)
+        colors_line = f"Colores reales de variantes (USAR ESTOS en el campo 'colors'): {', '.join(colors_normalized)}"
+
+    title_keywords = _extract_title_keywords(title)
+
+    prompt = USER_TEMPLATE.format(
+        title=title,
+        description=desc_for_prompt,
+        materials=materials_text,
+        store_context=store_context,
+        colors_line=colors_line,
+        title_keywords=title_keywords,
+    )
+
+    # Decidir si usar imagen o no
+    use_image = image_url and not _text_is_sufficient(title, clean_desc)
+
+    if use_image:
+        logger.debug(f"  Usando imagen para '{title[:40]}' (texto insuficiente)")
+        result = _classify_with_image(prompt, image_url)
+        if result:
+            if colors_hint:
+                result["colors"] = _normalize_colors(colors_hint)[:8]
+            return result
+        logger.info(f"  Imagen falló para '{title[:40]}', usando solo texto")
+    else:
+        logger.debug(f"  Usando solo texto para '{title[:40]}' (texto suficiente)")
+
+    result = _classify_text_only(prompt)
+
+    if colors_hint:
+        result["colors"] = _normalize_colors(colors_hint)[:8]
+
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Llamadas a la API
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _classify_with_image(prompt: str, image_url: str) -> Optional[dict]:
     """Clasifica usando la imagen del producto."""
     try:
@@ -431,7 +475,15 @@ def _classify_with_image(prompt: str, image_url: str) -> Optional[dict]:
         message = client.messages.create(
             model=settings.AI_MODEL,
             max_tokens=settings.AI_MAX_TOKENS,
-            system=CLASSIFICATION_SYSTEM,
+            # Cache aplicado al system prompt — se reutiliza entre llamadas
+            # del mismo batch pagando $0.30/MTok en vez de $3/MTok
+            system=[
+                {
+                    "type": "text",
+                    "text": CLASSIFICATION_SYSTEM,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
             messages=[{
                 "role": "user",
                 "content": [
@@ -450,9 +502,8 @@ def _classify_with_image(prompt: str, image_url: str) -> Optional[dict]:
         raw = message.content[0].text
         result = _parse_response(raw)
 
-        # Si la IA devolvió "otro" con imagen, loggear para debug
         if result.get("category") == "otro":
-            logger.warning(f"Clasificación con imagen devolvió 'otro'. Prompt title keywords incluidos.")
+            logger.warning(f"Clasificación con imagen devolvió 'otro'.")
 
         return result
 
@@ -470,7 +521,15 @@ def _classify_text_only(prompt: str) -> dict:
         message = client.messages.create(
             model=settings.AI_MODEL,
             max_tokens=settings.AI_MAX_TOKENS,
-            system=CLASSIFICATION_SYSTEM,
+            # Cache aplicado al system prompt — se reutiliza entre llamadas
+            # del mismo batch pagando $0.30/MTok en vez de $3/MTok
+            system=[
+                {
+                    "type": "text",
+                    "text": CLASSIFICATION_SYSTEM,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
             messages=[{"role": "user", "content": prompt}]
         )
         return _parse_response(message.content[0].text)
@@ -482,6 +541,10 @@ def _classify_text_only(prompt: str) -> dict:
         logger.error(f"Error inesperado en clasificación: {e}")
         return _fallback_classification()
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Helpers de imagen y parsing
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _download_image(url: str) -> tuple[Optional[str], str]:
     """Descarga una imagen y la convierte a base64."""
@@ -504,7 +567,6 @@ def _download_image(url: str) -> tuple[Optional[str], str]:
             else:
                 media_type = "image/jpeg"
 
-            # Límite de 1.5MB para no gastar tokens innecesarios
             if len(r.content) > 1_500_000:
                 logger.debug(f"Imagen muy grande ({len(r.content)/1024:.0f}KB), saltando")
                 return None, media_type
@@ -520,7 +582,6 @@ def _parse_response(raw: str) -> dict:
     """Parsea y valida la respuesta JSON de Claude."""
     raw = raw.strip()
 
-    # Limpiar backticks si los hay
     if "```" in raw:
         for part in raw.split("```"):
             part = part.strip().lstrip("json").strip()
@@ -567,7 +628,6 @@ def _parse_response(raw: str) -> dict:
     if gender not in ("hombre", "mujer", "unisex"):
         gender = "unisex"
 
-    # Normalizar stretch: aceptar bool, string "true"/"false", o null
     stretch_raw = data.get("stretch")
     if isinstance(stretch_raw, bool):
         stretch = stretch_raw

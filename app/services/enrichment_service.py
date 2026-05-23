@@ -5,8 +5,9 @@ Flujo:
 1. Busca productos con enriched=False en la DB (o todos si force=True)
 2. Visita la página individual de cada producto
 3. Extrae descripción completa, materiales, talles y colores de variantes
-4. Clasifica con IA usando toda la info disponible
-5. Marca enriched=True y ai_classified=True
+4. Limpia la descripción de texto de marketing antes de clasificar
+5. Clasifica con IA usando toda la info disponible
+6. Marca enriched=True y ai_classified=True
 
 Soporta Tienda Nube y WooCommerce.
 """
@@ -19,7 +20,7 @@ from bs4 import BeautifulSoup
 from sqlalchemy.orm import Session
 from app.models.models import Product, Store
 from app.scrapers.base_scraper import BaseScraper
-from app.services.ai_classifier import classify_product
+from app.services.ai_classifier import classify_product, _clean_description
 
 logger = logging.getLogger(__name__)
 
@@ -121,8 +122,6 @@ class ProductEnricher(BaseScraper):
         materials_raw = self._extract_materials_text(soup, description)
         return {"description": description, "materials_raw": materials_raw, "sizes": sizes, "colors_hint": colors}
 
-    # ── WooCommerce ──────────────────────────────────────────────────────────
-
     def _extract_woocommerce(self, soup: BeautifulSoup) -> dict:
         description = self._extract_description(soup, [
             ".woocommerce-product-details__short-description",
@@ -168,6 +167,8 @@ class ProductEnricher(BaseScraper):
                 if el:
                     text = el.get_text(separator=" ", strip=True)
                     if text and len(text) > 10:
+                        # Guardamos el texto crudo — la limpieza se hace
+                        # en classify_product para no perder info de materiales
                         return text[:1200]
             except Exception:
                 continue
@@ -228,7 +229,6 @@ def run_enrichment_job(
     if not force:
         query = query.filter(Product.enriched == False)  # noqa: E712
     else:
-        # Priorizar los peor clasificados: 'otro' primero, luego no clasificados, luego el resto
         from sqlalchemy import case
         priority = case(
             (Product.category == "otro", 0),
@@ -250,7 +250,6 @@ def run_enrichment_job(
 
     logger.info(f"Enriquecimiento {'[FORCE] ' if force else ''}procesando {len(pending)} productos...")
 
-    # Resetear flags ANTES de procesar para que el flujo de guardado sea idéntico
     if force:
         for product in pending:
             product.enriched = False
@@ -261,7 +260,6 @@ def run_enrichment_job(
     enriched_count = 0
     failed_count = 0
 
-    # Cargar tiendas en un dict para no hacer N queries
     store_ids = {p.store_id for p in pending}
     stores = {s.id: s for s in db.query(Store).filter(Store.id.in_(store_ids)).all()}
 
@@ -277,7 +275,8 @@ def run_enrichment_job(
             # 1. Visitar página individual
             enriched_data = enricher.enrich_product(product, store)
 
-            # 2. Actualizar campos de página
+            # 2. Actualizar descripción con el texto crudo de la página
+            #    (se guarda sin limpiar para no perder info de materiales en DB)
             page_description = enriched_data.get("description")
             if page_description:
                 if not product.description or len(page_description) > len(product.description or ""):
@@ -291,7 +290,7 @@ def run_enrichment_job(
 
             colors_hint = enriched_data.get("colors_hint") or []
 
-            # 3. Clasificar con IA
+            # 3. Construir descripción para IA (limpiada de marketing)
             full_description = _build_full_description(product, enriched_data)
 
             logger.info(
@@ -299,6 +298,8 @@ def run_enrichment_job(
                 f"(hint_colors={colors_hint[:3]}, desc={len(full_description or '')}c)"
             )
 
+            # 4. Clasificar con IA
+            #    _clean_description se aplica dentro de classify_product
             classification = classify_product(
                 title=product.title,
                 description=full_description,
@@ -307,7 +308,7 @@ def run_enrichment_job(
                 colors_hint=colors_hint if colors_hint else None,
             )
 
-            # 4. Guardar
+            # 5. Guardar clasificación
             product.category         = classification["category"]
             product.subcategory      = classification["subcategory"]
             product.colors           = classification["colors"]
@@ -360,7 +361,11 @@ def run_enrichment_job(
 
 
 def _build_full_description(product: Product, enriched_data: dict) -> Optional[str]:
-    """Combina descripción de página + materiales + talles para el prompt de IA."""
+    """
+    Combina descripción de página + materiales + talles para el prompt de IA.
+    La descripción se guarda cruda en DB pero se limpia en classify_product
+    antes de mandarla al modelo.
+    """
     parts = []
 
     page_desc = enriched_data.get("description")

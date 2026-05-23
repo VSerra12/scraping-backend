@@ -499,6 +499,12 @@ def _classify_with_image(prompt: str, image_url: str) -> Optional[dict]:
                 ],
             }]
         )
+        logger.info(
+            f"  Tokens — input: {message.usage.input_tokens} | "
+            f"output: {message.usage.output_tokens} | "
+            f"cache_read: {getattr(message.usage, 'cache_read_input_tokens', 0)} | "
+            f"cache_write: {getattr(message.usage, 'cache_creation_input_tokens', 0)}"
+        )
         raw = message.content[0].text
         result = _parse_response(raw)
 
@@ -532,6 +538,13 @@ def _classify_text_only(prompt: str) -> dict:
             ],
             messages=[{"role": "user", "content": prompt}]
         )
+        logger.info(
+            f"  Tokens — input: {message.usage.input_tokens} | "
+            f"output: {message.usage.output_tokens} | "
+            f"cache_read: {getattr(message.usage, 'cache_read_input_tokens', 0)} | "
+            f"cache_write: {getattr(message.usage, 'cache_creation_input_tokens', 0)}"
+        )
+        
         return _parse_response(message.content[0].text)
 
     except anthropic.APIError as e:

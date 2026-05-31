@@ -372,3 +372,39 @@ def get_stats(db: Session = Depends(get_db)):
         pending_enrichment=pending_enrichment,
         total_searches=total_searches,
     )
+
+@router.patch("/stores/{store_id}", response_model=StoreRead, tags=["Tiendas"])
+def update_store(
+    store_id: int,
+    store_data: StoreUpdate,
+    db: Session = Depends(get_db),
+    _: dict = Depends(require_admin),
+):
+    """
+    Actualiza los datos de una tienda (PATCH parcial).
+    Solo se modifican los campos enviados en el body.
+    Si se cambia catalog_url, el cambio tendrá efecto en el próximo scraping.
+    """
+    store = db.query(Store).filter(Store.id == store_id).first()
+    if not store:
+        raise HTTPException(status_code=404, detail="Tienda no encontrada")
+ 
+    # Verificar unicidad de name/url si se cambian
+    update_data = store_data.model_dump(exclude_none=True)
+ 
+    if "name" in update_data and update_data["name"] != store.name:
+        existing = db.query(Store).filter(Store.name == update_data["name"]).first()
+        if existing:
+            raise HTTPException(status_code=409, detail="Ya existe una tienda con ese nombre")
+ 
+    if "url" in update_data and update_data["url"] != store.url:
+        existing = db.query(Store).filter(Store.url == update_data["url"]).first()
+        if existing:
+            raise HTTPException(status_code=409, detail="Ya existe una tienda con esa URL")
+ 
+    for field, value in update_data.items():
+        setattr(store, field, value)
+ 
+    db.commit()
+    db.refresh(store)
+    return store

@@ -6,7 +6,7 @@ from sqlalchemy import func
 from app.core.database import get_db
 from app.models.models import Store, Product, SearchLog, ScrapeLog
 from app.models.schemas import (
-    StoreCreate, StoreRead,
+    StoreCreate, StoreRead, StoreUpdate,
     SearchRequest, SearchResponse,
     ScrapeResponse, StatsResponse,
     ScrapeLogRead, StoreEnrichStatus,
@@ -25,7 +25,11 @@ router.include_router(ai_router)
 # ─── Stores ────────────────────────────────────────────────────────────────────
 
 @router.post("/stores", response_model=StoreRead, status_code=201, tags=["Tiendas"])
-def create_store(store_data: StoreCreate, db: Session = Depends(get_db), _: dict = Depends(require_admin)):
+def create_store(
+    store_data: StoreCreate,
+    db: Session = Depends(get_db),
+    _: dict = Depends(require_admin),
+):
     existing = db.query(Store).filter(Store.url == store_data.url).first()
     if existing:
         raise HTTPException(status_code=409, detail="Ya existe una tienda con esa URL")
@@ -56,8 +60,39 @@ def get_store(store_id: int, db: Session = Depends(get_db)):
     return store
 
 
+@router.patch("/stores/{store_id}", response_model=StoreRead, tags=["Tiendas"])
+def update_store(
+    store_id: int,
+    data: StoreUpdate,
+    db: Session = Depends(get_db),
+    _: dict = Depends(require_admin),
+):
+    """
+    Actualiza campos de una tienda. Todos los campos son opcionales.
+    Incluye scraper_type para cambiar el scraper sin recrear la tienda.
+    """
+    store = db.query(Store).filter(Store.id == store_id).first()
+    if not store:
+        raise HTTPException(status_code=404, detail="Tienda no encontrada")
+
+    update_data = data.model_dump(exclude_unset=True)
+    if not update_data:
+        raise HTTPException(status_code=400, detail="No se proporcionaron campos para actualizar")
+
+    for field, value in update_data.items():
+        setattr(store, field, value)
+
+    db.commit()
+    db.refresh(store)
+    return store
+
+
 @router.delete("/stores/{store_id}", status_code=204, tags=["Tiendas"])
-def delete_store(store_id: int, db: Session = Depends(get_db), _: dict = Depends(require_admin)):
+def delete_store(
+    store_id: int,
+    db: Session = Depends(get_db),
+    _: dict = Depends(require_admin),
+):
     store = db.query(Store).filter(Store.id == store_id).first()
     if not store:
         raise HTTPException(status_code=404, detail="Tienda no encontrada")
@@ -66,7 +101,11 @@ def delete_store(store_id: int, db: Session = Depends(get_db), _: dict = Depends
 
 
 @router.patch("/stores/{store_id}/toggle", response_model=StoreRead, tags=["Tiendas"])
-def toggle_store_active(store_id: int, db: Session = Depends(get_db), _: dict = Depends(require_admin)):
+def toggle_store_active(
+    store_id: int,
+    db: Session = Depends(get_db),
+    _: dict = Depends(require_admin),
+):
     store = db.query(Store).filter(Store.id == store_id).first()
     if not store:
         raise HTTPException(status_code=404, detail="Tienda no encontrada")
@@ -103,11 +142,7 @@ def scrape_all_stores(
     return [scrape_and_save(store, db) for store in stores]
 
 
-@router.get(
-    "/scrape-logs/{store_id}",
-    response_model=list[ScrapeLogRead],
-    tags=["Scraping"],
-)
+@router.get("/scrape-logs/{store_id}", response_model=list[ScrapeLogRead], tags=["Scraping"])
 def get_scrape_logs(
     store_id: int,
     limit: int = Query(default=10, ge=1, le=100),
@@ -116,7 +151,6 @@ def get_scrape_logs(
     store = db.query(Store).filter(Store.id == store_id).first()
     if not store:
         raise HTTPException(status_code=404, detail="Tienda no encontrada")
-
     logs = (
         db.query(ScrapeLog)
         .filter(ScrapeLog.store_id == store_id)
@@ -131,28 +165,17 @@ def get_scrape_logs(
 
 @router.delete("/cleanup/unavailable", tags=["Scraping"])
 def cleanup_unavailable_products(
-    days: int = Query(default=7, ge=1, le=365, description="Días sin aparecer para eliminar el producto"),
-    store_id: int = Query(default=None, description="Filtrar por tienda específica (opcional)"),
+    days: int = Query(default=7, ge=1, le=365),
+    store_id: int = Query(default=None),
     db: Session = Depends(get_db),
     _: dict = Depends(require_admin),
 ):
-    """
-    Elimina manualmente productos con available=False cuyo updated_at
-    supera `days` días. Si store_id no se especifica, limpia todas las tiendas.
-
-    Los scrapings automáticos ya hacen esta limpieza para 7 días,
-    pero este endpoint permite forzarla con un umbral distinto o por tienda.
-    """
     if store_id is not None:
         store = db.query(Store).filter(Store.id == store_id).first()
         if not store:
             raise HTTPException(status_code=404, detail="Tienda no encontrada")
-
     result = delete_unavailable_products(db, store_id=store_id, days=days)
-    return {
-        "message": f"{result['deleted_total']} productos eliminados",
-        **result,
-    }
+    return {"message": f"{result['deleted_total']} productos eliminados", **result}
 
 
 # ─── Enriquecimiento ───────────────────────────────────────────────────────────
@@ -161,12 +184,13 @@ def cleanup_unavailable_products(
 def enrich_products(
     batch_size: int = 20,
     store_id: int = None,
+    force: bool = False,
     db: Session = Depends(get_db),
     _: dict = Depends(require_admin),
 ):
     if batch_size < 1 or batch_size > 100:
         raise HTTPException(status_code=400, detail="batch_size debe estar entre 1 y 100")
-    result = run_enrichment_job(db, batch_size=batch_size, store_id=store_id)
+    result = run_enrichment_job(db, batch_size=batch_size, store_id=store_id, force=force)
     status = get_enrichment_status(db)
     return {
         "message": "Enriquecimiento completo",
@@ -176,15 +200,8 @@ def enrich_products(
     }
 
 
-@router.get(
-    "/enrich/status",
-    tags=["Scraping"],
-)
+@router.get("/enrich/status", tags=["Scraping"])
 def enrichment_status(db: Session = Depends(get_db)):
-    """
-    Público — el front lo usa para mostrar progreso de enriquecimiento.
-    Incluye el último scrape log de cada tienda.
-    """
     global_status = get_enrichment_status(db)
     stores = db.query(Store).all()
 
@@ -225,48 +242,36 @@ def enrichment_status(db: Session = Depends(get_db)):
         ))
 
     return {**global_status, "by_store": [s.model_dump() for s in by_store]}
+
+
 @router.post("/enrich/product/{product_id}", tags=["Scraping"])
 def enrich_single_product(
     product_id: int,
     db: Session = Depends(get_db),
     _: dict = Depends(require_admin),
 ):
-    """
-    Re-clasifica un producto individual con enriquecimiento completo:
-    1. Visita la página del producto para extraer descripción, materiales y talles.
-    2. Clasifica con IA usando toda la info disponible.
-    3. Guarda y devuelve los campos actualizados.
-    """
     from app.services.enrichment_service import ProductEnricher, _build_full_description
     from app.services.ai_classifier import classify_product
 
     product = db.query(Product).filter(Product.id == product_id).first()
     if not product:
         raise HTTPException(status_code=404, detail="Producto no encontrado")
-
     store = db.query(Store).filter(Store.id == product.store_id).first()
     if not store:
         raise HTTPException(status_code=404, detail="Tienda no encontrada")
 
     enricher = ProductEnricher()
-
-    # 1. Visitar página individual
     enriched_data = enricher.enrich_product(product, store)
 
-    # 2. Actualizar descripción y materiales si se obtuvieron datos nuevos
     page_description = enriched_data.get("description")
     if page_description and len(page_description) > len(product.description or ""):
         product.description = page_description
-
     if enriched_data.get("materials_raw"):
         product.materials_raw = enriched_data["materials_raw"]
-
     if enriched_data.get("sizes"):
         product.sizes = enriched_data["sizes"]
 
     colors_hint = enriched_data.get("colors_hint") or []
-
-    # 3. Clasificar con IA
     full_description = _build_full_description(product, enriched_data)
 
     classification = classify_product(
@@ -277,7 +282,6 @@ def enrich_single_product(
         colors_hint=colors_hint if colors_hint else None,
     )
 
-    # 4. Guardar todos los campos
     product.category         = classification["category"]
     product.subcategory      = classification["subcategory"]
     product.colors           = classification["colors"]
@@ -304,7 +308,6 @@ def enrich_single_product(
     db.commit()
     db.refresh(product)
 
-    # 5. Devolver los campos que el frontend necesita para actualizar la UI
     return {
         "id":             product.id,
         "category":       product.category,
@@ -325,17 +328,19 @@ def enrich_single_product(
         "enriched":       product.enriched,
     }
 
+
 @router.post("/enrich/{store_id}", tags=["Scraping"])
 def enrich_store(
     store_id: int,
     batch_size: int = 20,
+    force: bool = False,
     db: Session = Depends(get_db),
     _: dict = Depends(require_admin),
 ):
     store = db.query(Store).filter(Store.id == store_id).first()
     if not store:
         raise HTTPException(status_code=404, detail="Tienda no encontrada")
-    result = run_enrichment_job(db, batch_size=batch_size, store_id=store_id)
+    result = run_enrichment_job(db, batch_size=batch_size, store_id=store_id, force=force)
     status = get_enrichment_status(db)
     return {
         "message": f"Enriquecimiento de {store.name} completo",
@@ -372,39 +377,3 @@ def get_stats(db: Session = Depends(get_db)):
         pending_enrichment=pending_enrichment,
         total_searches=total_searches,
     )
-
-@router.patch("/stores/{store_id}", response_model=StoreRead, tags=["Tiendas"])
-def update_store(
-    store_id: int,
-    store_data: StoreUpdate,
-    db: Session = Depends(get_db),
-    _: dict = Depends(require_admin),
-):
-    """
-    Actualiza los datos de una tienda (PATCH parcial).
-    Solo se modifican los campos enviados en el body.
-    Si se cambia catalog_url, el cambio tendrá efecto en el próximo scraping.
-    """
-    store = db.query(Store).filter(Store.id == store_id).first()
-    if not store:
-        raise HTTPException(status_code=404, detail="Tienda no encontrada")
- 
-    # Verificar unicidad de name/url si se cambian
-    update_data = store_data.model_dump(exclude_none=True)
- 
-    if "name" in update_data and update_data["name"] != store.name:
-        existing = db.query(Store).filter(Store.name == update_data["name"]).first()
-        if existing:
-            raise HTTPException(status_code=409, detail="Ya existe una tienda con ese nombre")
- 
-    if "url" in update_data and update_data["url"] != store.url:
-        existing = db.query(Store).filter(Store.url == update_data["url"]).first()
-        if existing:
-            raise HTTPException(status_code=409, detail="Ya existe una tienda con esa URL")
- 
-    for field, value in update_data.items():
-        setattr(store, field, value)
- 
-    db.commit()
-    db.refresh(store)
-    return store

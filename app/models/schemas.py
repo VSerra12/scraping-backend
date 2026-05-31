@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Literal
 from pydantic import BaseModel, field_validator
+
+# Valores válidos para scraper_type
+ScraperType = Literal["auto", "tiendanube", "woocommerce", "shopnatural", "generic"]
 
 
 # ── Stores ──────────────────────────────────────────────────────────────────
@@ -14,6 +17,18 @@ class StoreCreate(BaseModel):
     country: str = "AR"
     location: Optional[str] = None
     active: bool = True
+    scraper_type: ScraperType = "auto"
+
+
+class StoreUpdate(BaseModel):
+    """Campos actualizables de una tienda (todos opcionales)."""
+    name: Optional[str] = None
+    url: Optional[str] = None
+    catalog_url: Optional[str] = None
+    country: Optional[str] = None
+    location: Optional[str] = None
+    active: Optional[bool] = None
+    scraper_type: Optional[ScraperType] = None
 
 
 class StoreRead(BaseModel):
@@ -26,6 +41,7 @@ class StoreRead(BaseModel):
     active: bool
     last_scraped: Optional[datetime]
     created_at: datetime
+    scraper_type: ScraperType
 
     model_config = {"from_attributes": True}
 
@@ -53,18 +69,15 @@ class ProductRead(BaseModel):
     store_id: int
     store_name: Optional[str] = None
 
-    # Info enriquecida
     materials_raw: Optional[str] = None
     sizes: Optional[list[str]] = None
 
-    # Clasificación base
     category: Optional[str] = None
     subcategory: Optional[str] = None
     colors: Optional[list[str]] = None
     style_tags: Optional[list[str]] = None
     gender: Optional[str] = None
 
-    # Clasificación expandida
     cut: Optional[str] = None
     leg_cut:  Optional[str] = None
     rise:     Optional[str] = None
@@ -80,7 +93,6 @@ class ProductRead(BaseModel):
     sleeve_type: Optional[str] = None
     hem_finish: Optional[str] = None
 
-    # Estado
     condition: str = "new"
     available: bool = True
     enriched: bool = False
@@ -92,7 +104,6 @@ class ProductRead(BaseModel):
 
 
 class ProductSummary(BaseModel):
-    """Versión reducida para listados y resultados de búsqueda (menos payload)."""
     id: int
     title: str
     price: Optional[float] = None
@@ -134,7 +145,6 @@ class SearchRequest(BaseModel):
     limit: int = 50
     offset: int = 0
 
-    # Filtros base
     category: Optional[str] = None
     min_price: Optional[float] = None
     max_price: Optional[float] = None
@@ -143,7 +153,6 @@ class SearchRequest(BaseModel):
     gender: Optional[str] = None
     location: Optional[str] = None
 
-    # Filtros expandidos
     cut: Optional[str] = None
     pattern: Optional[str] = None
     style_tag: Optional[str] = None
@@ -210,7 +219,6 @@ class ScrapeLogRead(BaseModel):
 # ── Enrich status ─────────────────────────────────────────────────────────────
 
 class StoreEnrichStatus(BaseModel):
-    """Estado de enriquecimiento por tienda, incluyendo el último scrape log."""
     store_id: int
     store_name: str
     total: int

@@ -20,11 +20,16 @@ class Store(Base):
     created_at   = Column(DateTime,     nullable=False, default=datetime.utcnow)
     location     = Column(String(255),  nullable=True)
 
+    # Tipo de scraper a usar para esta tienda.
+    # Valores: 'auto' | 'tiendanube' | 'woocommerce' | 'shopnatural' | 'generic'
+    # 'auto' = detección automática por dominio/URL (comportamiento original).
+    scraper_type = Column(String(20), nullable=False, default="auto")
+
     products    = relationship("Product",   back_populates="store", cascade="all, delete-orphan")
     scrape_logs = relationship("ScrapeLog", back_populates="store", cascade="all, delete-orphan")
 
     def __repr__(self):
-        return f"<Store(name={self.name})>"
+        return f"<Store(name={self.name}, scraper_type={self.scraper_type})>"
 
 
 class Product(Base):
@@ -34,7 +39,6 @@ class Product(Base):
     external_id = Column(String(100), nullable=False)
     store_id    = Column(Integer,     ForeignKey("stores.id", ondelete="CASCADE"), nullable=False)
 
-    # Info básica
     title       = Column(String(500),  nullable=False)
     description = Column(Text,         nullable=True)
     price       = Column(Float,        nullable=True,  default=0.0)
@@ -42,7 +46,6 @@ class Product(Base):
     image_url   = Column(String(1000), nullable=True)
     product_url = Column(String(1000), nullable=False)
 
-    # Clasificación IA — base
     category    = Column(String(100), nullable=True)
     subcategory = Column(String(100), nullable=True)
     colors      = Column(JSON,        nullable=True)
@@ -50,7 +53,6 @@ class Product(Base):
     gender      = Column(String(20),  nullable=True)
     condition   = Column(String(20),  nullable=False, default="new")
 
-    # Estado
     available     = Column(Boolean, nullable=False, default=True)
     ai_classified = Column(Boolean, nullable=False, default=False)
     enriched      = Column(Boolean, nullable=False, default=False)
@@ -58,11 +60,9 @@ class Product(Base):
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-    # Info enriquecida
     materials_raw = Column(String(500), nullable=True)
     sizes         = Column(JSON,        nullable=True, default=list)
 
-    # Clasificación IA — expandida
     cut              = Column(String(50), nullable=True)
     materials        = Column(JSON,       nullable=True, default=list)
     texture          = Column(String(50), nullable=True)
@@ -81,7 +81,6 @@ class Product(Base):
     store    = relationship("Store",          back_populates="products")
     variants = relationship("ProductVariant", back_populates="product", cascade="all, delete-orphan")
 
-    # Solo el UniqueConstraint — los índices los crea create_tables() con IF NOT EXISTS
     __table_args__ = (
         UniqueConstraint("store_id", "external_id", name="products_store_id_external_id_key"),
     )
@@ -133,8 +132,6 @@ class ScrapeLog(Base):
     success          = Column(Boolean,  nullable=True, default=True)
 
     store = relationship("Store", back_populates="scrape_logs")
-
-    # Sin __table_args__ — los índices los crea create_tables() con IF NOT EXISTS
 
     def __repr__(self):
         return f"<ScrapeLog(store_id={self.store_id}, success={self.success}, started_at={self.started_at})>"

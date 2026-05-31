@@ -2,10 +2,10 @@
 Servicio de scraping que coordina:
 1. Descargar productos de la tienda
 2. Detectar productos nuevos vs existentes
-3. Agrupar variantes de color (ej: remera emily // negro, blanco, gris)
+3. Agrupar variantes de color
 4. Guardar productos nuevos con enriched=False
 5. Actualizar precio/disponibilidad de productos existentes
-6. Registrar un ScrapeLog por cada ejecución (éxito o error)
+6. Registrar un ScrapeLog por cada ejecución
 7. Eliminar productos unavailable con más de 7 días de antigüedad
 """
 import logging
@@ -22,134 +22,67 @@ from app.core.config import settings
 logger = logging.getLogger(__name__)
 
 TIENDANUBE_DOMAINS = ["mitiendanube.com", "tiendanube.com"]
-# Paths que SON exclusivos de WooCommerce
-WOOCOMMERCE_PATHS = ["/shop", "/tienda", "/store", "/product-category"]
-# Paths ambiguos que pueden ser TiendaNube O WooCommerce — no usar como señal sola
-AMBIGUOUS_PATHS = ["/productos", "/prendas", "/catalogo", "/coleccion", "/categoria"]
-
-LOW_YIELD_THRESHOLD = 0.20  # si scraped < 20% del histórico → no marcar ausentes
-UNAVAILABLE_TTL_DAYS = 7    # días hasta eliminar productos unavailable
+LOW_YIELD_THRESHOLD = 0.20
+UNAVAILABLE_TTL_DAYS = 7
 
 
-def _get_scraper(store):
+def _get_scraper(store: Store):
+    """
+    Devuelve el scraper correcto para la tienda.
+
+    Prioridad:
+      1. store.scraper_type explícito (cualquier valor distinto de 'auto')
+      2. Detección automática por dominio/URL (scraper_type == 'auto')
+    """
+    scraper_type = getattr(store, "scraper_type", "auto") or "auto"
+
+    # ── 1. Tipo explícito configurado en la tienda ────────────────────────────
+    if scraper_type != "auto":
+        logger.info(f"Scraper explícito para {store.name}: {scraper_type!r}")
+        if scraper_type == "tiendanube":
+            return TiendaNubeScraper()
+        if scraper_type == "woocommerce":
+            from app.scrapers.woocommerce_scraper import WooCommerceScraper
+            return WooCommerceScraper()
+        if scraper_type == "shopnatural":
+            from app.scrapers.shopnatural_scraper import ShopNaturalScraper
+            return ShopNaturalScraper()
+        if scraper_type == "generic":
+            return GenericScraper()
+        # Valor desconocido → caer a auto con warning
+        logger.warning(f"scraper_type desconocido: {scraper_type!r}, usando detección automática")
+
+    # ── 2. Detección automática (scraper_type == 'auto') ─────────────────────
     url     = store.url or ""
     catalog = store.catalog_url or ""
     combined = url + catalog
- 
-    # ── Scraper específico por dominio conocido ───────────────────────────────
+
     if "shopnatural.ar" in combined:
         from app.scrapers.shopnatural_scraper import ShopNaturalScraper
         return ShopNaturalScraper()
-    
-    # ── WooCommerce: paths exclusivos ─────────────────────────────────────────
-    if any(p in catalog for p in WOOCOMMERCE_PATHS):
-        from app.scrapers.woocommerce_scraper import WooCommerceScraper
-        return WooCommerceScraper()
- 
-    # ── TiendaNube: solo señales inequívocas ──────────────────────────────────
-    # Dominio oficial de TiendaNube
+
     if any(d in combined for d in TIENDANUBE_DOMAINS):
         return TiendaNubeScraper()
-    # ?mpage=N en la URL → exclusivo de TiendaNube
+
     if "mpage" in catalog:
         return TiendaNubeScraper()
- 
-    # ── Paths ambiguos (/productos, /prendas, etc.) → detectar por HTML ───────
-    # No asumir TiendaNube solo porque la URL tiene /productos — WooCommerce
-    # y otros CMS también usan esos paths.
-    if any(p in catalog for p in AMBIGUOUS_PATHS):
-        return _detect_scraper_from_html(store, catalog)
- 
-    # ── Sin señales claras → detectar por HTML ────────────────────────────────
-    return _detect_scraper_from_html(store, catalog)
 
-def _detect_scraper_from_html(store, catalog_url: str):
-    """
-    Hace un request ligero a la página de catálogo y detecta la plataforma
-    por señales en el HTML.
- 
-    TiendaNube: .js-item-product, [data-variants], .js-product-quantity-input
-    WooCommerce: li.product, .woocommerce-loop-product__title, .page-numbers,
-                 add_to_cart, .woocommerce
- 
-    Si no se puede determinar, retorna GenericScraper.
-    """
-    import logging
-    import requests
-    from bs4 import BeautifulSoup
-    from fake_useragent import UserAgent
- 
-    logger = logging.getLogger(__name__)
- 
-    try:
-        ua = UserAgent()
-        headers = {
-            "User-Agent": ua.random,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "es-AR,es;q=0.9",
-        }
-        resp = requests.get(catalog_url, headers=headers, timeout=10)
-        if resp.status_code != 200:
-            logger.warning(f"_detect_scraper_from_html: HTTP {resp.status_code} en {catalog_url}, usando GenericScraper")
-            return GenericScraper()
- 
-        soup = BeautifulSoup(resp.content, "html.parser")
- 
-        # Señales de TiendaNube
-        tiendanube_signals = [
-            bool(soup.select_one(".js-item-product")),
-            bool(soup.select_one("[data-variants]")),
-            bool(soup.select_one(".js-product-quantity-input")),
-            bool(soup.select_one(".js-item-name")),
-        ]
- 
-        # Señales de WooCommerce
-        woocommerce_signals = [
-            bool(soup.select_one("li.product")),
-            bool(soup.select_one(".woocommerce-loop-product__title")),
-            bool(soup.select_one(".add_to_cart_button")),
-            bool(soup.select_one(".page-numbers")),
-            bool(soup.select_one(".woocommerce")),
-            bool(soup.select_one("[data-product_id]")),
-        ]
- 
-        tn_score = sum(tiendanube_signals)
-        wc_score = sum(woocommerce_signals)
- 
-        logger.info(
-            f"_detect_scraper_from_html: {store.name} → "
-            f"TiendaNube={tn_score}, WooCommerce={wc_score}"
-        )
- 
-        if tn_score > wc_score and tn_score >= 1:
-            logger.info(f"  → TiendaNubeScraper (score {tn_score})")
-            return TiendaNubeScraper()
- 
-        if wc_score >= 1:
-            logger.info(f"  → WooCommerceScraper (score {wc_score})")
-            from app.scrapers.woocommerce_scraper import WooCommerceScraper
-            return WooCommerceScraper()
- 
-        logger.info(f"  → GenericScraper (sin señales claras)")
-        return GenericScraper()
- 
-    except Exception as e:
-        logger.warning(f"_detect_scraper_from_html falló para {catalog_url}: {e}, usando GenericScraper")
-        return GenericScraper()
+    if any(p in catalog for p in ["/shop", "/tienda", "/store", "/product-category"]):
+        from app.scrapers.woocommerce_scraper import WooCommerceScraper
+        return WooCommerceScraper()
+
+    # Paths ambiguos (/productos, /prendas, etc.) ya no mapean automáticamente
+    # a TiendaNube — demasiados falsos positivos con tiendas WooCommerce.
+    # Si la detección automática falla, configurar scraper_type explícito en la tienda.
+    logger.info(
+        f"No se pudo determinar el scraper para {store.name!r} "
+        f"(catalog_url={catalog!r}). Usando GenericScraper. "
+        f"Recomendación: configurar scraper_type explícito en la tienda."
+    )
+    return GenericScraper()
 
 
 def scrape_and_save(store: Store, db: Session) -> ScrapeResponse:
-    """
-    Scrapea una tienda y guarda/actualiza productos.
-    Registra siempre un ScrapeLog al finalizar, sea éxito o error.
-
-    Guarda un warning en el log y omite _mark_missing_as_unavailable()
-    si los productos scrapeados son menos del 20% del total histórico,
-    para evitar desactivar el catálogo entero por un scraping parcial.
-
-    Al finalizar exitosamente, elimina productos unavailable con más de
-    UNAVAILABLE_TTL_DAYS días de antigüedad para esa tienda.
-    """
     scraper       = _get_scraper(store)
     errors        = []
     new_count     = 0
@@ -157,9 +90,8 @@ def scrape_and_save(store: Store, db: Session) -> ScrapeResponse:
     warning       = None
     started_at    = datetime.utcnow()
 
-    logger.info(f"Iniciando scraping de tienda: {store.name}")
+    logger.info(f"Iniciando scraping de tienda: {store.name} (scraper: {scraper.__class__.__name__})")
 
-    # ── 1. Obtener productos del scraper ──────────────────────────────────────
     try:
         raw_products = scraper.scrape_store(
             store.catalog_url,
@@ -189,7 +121,6 @@ def scrape_and_save(store: Store, db: Session) -> ScrapeResponse:
             errors=[error_msg],
         )
 
-    # ── 2. Procesar cada producto ─────────────────────────────────────────────
     for raw in raw_products:
         try:
             existing = _find_existing_product(db, store.id, raw)
@@ -248,12 +179,8 @@ def scrape_and_save(store: Store, db: Session) -> ScrapeResponse:
             db.rollback()
             continue
 
-    # ── 3. Marcar ausentes — con chequeo del 20% ─────────────────────────────
-    historic_count = db.query(Product).filter(
-        Product.store_id == store.id,
-    ).count()
-
-    scraped_count = len(raw_products)
+    historic_count = db.query(Product).filter(Product.store_id == store.id).count()
+    scraped_count  = len(raw_products)
 
     if historic_count > 0 and scraped_count < historic_count * LOW_YIELD_THRESHOLD:
         warning = (
@@ -265,14 +192,12 @@ def scrape_and_save(store: Store, db: Session) -> ScrapeResponse:
     else:
         _mark_missing_as_unavailable(db, store.id, raw_products)
 
-    # ── 4. Eliminar productos unavailable viejos ──────────────────────────────
     deleted_count = _delete_old_unavailable(db, store.id, days=UNAVAILABLE_TTL_DAYS)
     if deleted_count > 0:
         logger.info(f"[{store.name}] {deleted_count} productos unavailable eliminados (>{UNAVAILABLE_TTL_DAYS}d)")
 
     store.last_scraped = datetime.utcnow()
 
-    # ── 5. Guardar log ────────────────────────────────────────────────────────
     all_messages = [m for m in [warning] + errors if m]
     _write_scrape_log(
         db,
@@ -304,11 +229,6 @@ def scrape_and_save(store: Store, db: Session) -> ScrapeResponse:
 
 
 def delete_unavailable_products(db: Session, store_id: int = None, days: int = UNAVAILABLE_TTL_DAYS) -> dict:
-    """
-    Elimina productos con available=False cuyo updated_at supera `days` días.
-    Si store_id es None, limpia todas las tiendas.
-    Retorna conteo de eliminados por tienda.
-    """
     cutoff = datetime.utcnow() - timedelta(days=days)
 
     query = db.query(Product).filter(
@@ -320,7 +240,6 @@ def delete_unavailable_products(db: Session, store_id: int = None, days: int = U
 
     products_to_delete = query.all()
 
-    # Agrupar por tienda para el log
     by_store: dict[int, int] = {}
     for p in products_to_delete:
         by_store[p.store_id] = by_store.get(p.store_id, 0) + 1
@@ -343,22 +262,14 @@ def delete_unavailable_products(db: Session, store_id: int = None, days: int = U
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _delete_old_unavailable(db: Session, store_id: int, days: int = UNAVAILABLE_TTL_DAYS) -> int:
-    """
-    Elimina productos de una tienda con available=False
-    cuyo updated_at supera `days` días.
-    No hace commit — se commitea junto con el resto del scraping.
-    """
     cutoff = datetime.utcnow() - timedelta(days=days)
-
     products_to_delete = db.query(Product).filter(
         Product.store_id  == store_id,
         Product.available == False,       # noqa: E712
         Product.updated_at <= cutoff,
     ).all()
-
     for p in products_to_delete:
         db.delete(p)
-
     return len(products_to_delete)
 
 
@@ -391,13 +302,13 @@ def _write_scrape_log(
 def _find_existing_product(db: Session, store_id: int, raw: dict) -> Optional[Product]:
     if raw.get("external_id"):
         product = db.query(Product).filter(
-            Product.store_id  == store_id,
+            Product.store_id   == store_id,
             Product.external_id == str(raw["external_id"]),
         ).first()
         if product:
             return product
     return db.query(Product).filter(
-        Product.store_id  == store_id,
+        Product.store_id   == store_id,
         Product.product_url == raw["product_url"],
     ).first()
 

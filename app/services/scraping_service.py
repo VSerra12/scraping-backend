@@ -40,6 +40,11 @@ def _get_scraper(store):
     if "shopnatural.ar" in combined:
         from app.scrapers.shopnatural_scraper import ShopNaturalScraper
         return ShopNaturalScraper()
+    
+    # ── WooCommerce: paths exclusivos ─────────────────────────────────────────
+    if any(p in catalog for p in WOOCOMMERCE_PATHS):
+        from app.scrapers.woocommerce_scraper import WooCommerceScraper
+        return WooCommerceScraper()
  
     # ── TiendaNube: solo señales inequívocas ──────────────────────────────────
     # Dominio oficial de TiendaNube
@@ -48,11 +53,6 @@ def _get_scraper(store):
     # ?mpage=N en la URL → exclusivo de TiendaNube
     if "mpage" in catalog:
         return TiendaNubeScraper()
- 
-    # ── WooCommerce: paths exclusivos ─────────────────────────────────────────
-    if any(p in catalog for p in WOOCOMMERCE_PATHS):
-        from app.scrapers.woocommerce_scraper import WooCommerceScraper
-        return WooCommerceScraper()
  
     # ── Paths ambiguos (/productos, /prendas, etc.) → detectar por HTML ───────
     # No asumir TiendaNube solo porque la URL tiene /productos — WooCommerce

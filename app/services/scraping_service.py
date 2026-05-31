@@ -22,28 +22,120 @@ from app.core.config import settings
 logger = logging.getLogger(__name__)
 
 TIENDANUBE_DOMAINS = ["mitiendanube.com", "tiendanube.com"]
+# Paths que SON exclusivos de WooCommerce
+WOOCOMMERCE_PATHS = ["/shop", "/tienda", "/store", "/product-category"]
+# Paths ambiguos que pueden ser TiendaNube O WooCommerce — no usar como señal sola
+AMBIGUOUS_PATHS = ["/productos", "/prendas", "/catalogo", "/coleccion", "/categoria"]
+
 LOW_YIELD_THRESHOLD = 0.20  # si scraped < 20% del histórico → no marcar ausentes
 UNAVAILABLE_TTL_DAYS = 7    # días hasta eliminar productos unavailable
 
 
 def _get_scraper(store):
-    url      = store.url or ""
-    catalog  = store.catalog_url or ""
+    url     = store.url or ""
+    catalog = store.catalog_url or ""
     combined = url + catalog
-    
+ 
+    # ── Scraper específico por dominio conocido ───────────────────────────────
     if "shopnatural.ar" in combined:
         from app.scrapers.shopnatural_scraper import ShopNaturalScraper
         return ShopNaturalScraper()
+ 
+    # ── TiendaNube: solo señales inequívocas ──────────────────────────────────
+    # Dominio oficial de TiendaNube
     if any(d in combined for d in TIENDANUBE_DOMAINS):
         return TiendaNubeScraper()
+    # ?mpage=N en la URL → exclusivo de TiendaNube
     if "mpage" in catalog:
         return TiendaNubeScraper()
-    if any(p in catalog for p in ["/productos", "/prendas", "/catalogo", "/coleccion", "/categoria"]):
-        return TiendaNubeScraper()
-    if any(p in catalog for p in ["/shop", "/tienda", "/store"]):
+ 
+    # ── WooCommerce: paths exclusivos ─────────────────────────────────────────
+    if any(p in catalog for p in WOOCOMMERCE_PATHS):
         from app.scrapers.woocommerce_scraper import WooCommerceScraper
         return WooCommerceScraper()
-    return GenericScraper()
+ 
+    # ── Paths ambiguos (/productos, /prendas, etc.) → detectar por HTML ───────
+    # No asumir TiendaNube solo porque la URL tiene /productos — WooCommerce
+    # y otros CMS también usan esos paths.
+    if any(p in catalog for p in AMBIGUOUS_PATHS):
+        return _detect_scraper_from_html(store, catalog)
+ 
+    # ── Sin señales claras → detectar por HTML ────────────────────────────────
+    return _detect_scraper_from_html(store, catalog)
+
+def _detect_scraper_from_html(store, catalog_url: str):
+    """
+    Hace un request ligero a la página de catálogo y detecta la plataforma
+    por señales en el HTML.
+ 
+    TiendaNube: .js-item-product, [data-variants], .js-product-quantity-input
+    WooCommerce: li.product, .woocommerce-loop-product__title, .page-numbers,
+                 add_to_cart, .woocommerce
+ 
+    Si no se puede determinar, retorna GenericScraper.
+    """
+    import logging
+    import requests
+    from bs4 import BeautifulSoup
+    from fake_useragent import UserAgent
+ 
+    logger = logging.getLogger(__name__)
+ 
+    try:
+        ua = UserAgent()
+        headers = {
+            "User-Agent": ua.random,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "es-AR,es;q=0.9",
+        }
+        resp = requests.get(catalog_url, headers=headers, timeout=10)
+        if resp.status_code != 200:
+            logger.warning(f"_detect_scraper_from_html: HTTP {resp.status_code} en {catalog_url}, usando GenericScraper")
+            return GenericScraper()
+ 
+        soup = BeautifulSoup(resp.content, "html.parser")
+ 
+        # Señales de TiendaNube
+        tiendanube_signals = [
+            bool(soup.select_one(".js-item-product")),
+            bool(soup.select_one("[data-variants]")),
+            bool(soup.select_one(".js-product-quantity-input")),
+            bool(soup.select_one(".js-item-name")),
+        ]
+ 
+        # Señales de WooCommerce
+        woocommerce_signals = [
+            bool(soup.select_one("li.product")),
+            bool(soup.select_one(".woocommerce-loop-product__title")),
+            bool(soup.select_one(".add_to_cart_button")),
+            bool(soup.select_one(".page-numbers")),
+            bool(soup.select_one(".woocommerce")),
+            bool(soup.select_one("[data-product_id]")),
+        ]
+ 
+        tn_score = sum(tiendanube_signals)
+        wc_score = sum(woocommerce_signals)
+ 
+        logger.info(
+            f"_detect_scraper_from_html: {store.name} → "
+            f"TiendaNube={tn_score}, WooCommerce={wc_score}"
+        )
+ 
+        if tn_score > wc_score and tn_score >= 1:
+            logger.info(f"  → TiendaNubeScraper (score {tn_score})")
+            return TiendaNubeScraper()
+ 
+        if wc_score >= 1:
+            logger.info(f"  → WooCommerceScraper (score {wc_score})")
+            from app.scrapers.woocommerce_scraper import WooCommerceScraper
+            return WooCommerceScraper()
+ 
+        logger.info(f"  → GenericScraper (sin señales claras)")
+        return GenericScraper()
+ 
+    except Exception as e:
+        logger.warning(f"_detect_scraper_from_html falló para {catalog_url}: {e}, usando GenericScraper")
+        return GenericScraper()
 
 
 def scrape_and_save(store: Store, db: Session) -> ScrapeResponse:
